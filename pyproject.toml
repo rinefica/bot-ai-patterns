@@ -1,0 +1,20 @@
+[project]
+name = "bot-ai-patterns"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "yalanskaya", email = "yalanskaya@banki.ru" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "openai>=3.6.0",
+    "python-dotenv>=1.2.3",
+]
+
+[project.scripts]
+bot-ai-patterns = "bot_ai_patterns:main"
+
+[build-system]
+requires = ["uv_build>=0.12.7,<0.13.0"]
+build-backend = "uv_build"
