@@ -8,12 +8,14 @@ authors = [
 ]
 requires-python = ">=3.13"
 dependencies = [
+    "aiogram>=3.0.0",
     "openai>=3.6.0",
     "python-dotenv>=1.2.3",
 ]
 
 [project.scripts]
 bot-ai-patterns = "bot_ai_patterns:main"
+tg-bot = "bot_ai_patterns.telegram:main"
 
 [build-system]
 requires = ["uv_build>=0.12.7,<0.13.0"]
