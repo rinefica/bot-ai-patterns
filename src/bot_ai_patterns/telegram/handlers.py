@@ -5,6 +5,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message
 
 from bot_ai_patterns.client import get_client
+from bot_ai_patterns.model_comparison import compare_models, format_summary
 from bot_ai_patterns.strategies import run as run_strategy
 from bot_ai_patterns.utils import html_to_telegram, sanitize
 
@@ -14,13 +15,23 @@ _client = get_client()
 
 class Form(StatesGroup):
     waiting_for_query = State()
+    comparing_models = State()
 
 
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer("Привет! Отправь мне задачу — получишь 3 варианта ответа. /stop чтобы остановить.")
+    await message.answer(
+        "Привет! Отправь мне задачу — получишь 3 варианта ответа. /stop чтобы остановить.\n"
+        "/compare — сравнить модели разного уровня."
+    )
     await state.set_state(Form.waiting_for_query)
+
+
+@router.message(Command("compare"))
+async def cmd_compare(message: Message, state: FSMContext) -> None:
+    await state.set_state(Form.comparing_models)
+    await message.answer("Отправь запрос — запущу его на трёх моделях и сравню результаты.")
 
 
 @router.message(Command("stop"))
@@ -52,3 +63,32 @@ async def handle_query(message: Message, state: FSMContext) -> None:
 
     await message.answer("Отправь новый запрос или /stop для завершения.")
     await state.set_state(Form.waiting_for_query)
+
+
+@router.message(Form.comparing_models)
+async def handle_compare(message: Message, state: FSMContext) -> None:
+    user_message = sanitize(message.text or "")
+    if not user_message:
+        return
+
+    status = await message.answer("Запрашиваю три модели параллельно...")
+
+    results = await compare_models(_client, user_message)
+
+    await status.delete()
+
+    for r in results:
+        if r.error:
+            await message.answer(f"<b>{r.label}</b>\n\nОшибка: {r.error}", parse_mode="HTML")
+        else:
+            await message.answer(
+                f"<b>{r.label}</b>\n\n{html_to_telegram(r.response)}",
+                parse_mode="HTML",
+            )
+
+    summary = format_summary(results)
+    await message.answer(
+        f"<b>📊 Сравнение</b>\n<pre>{summary}</pre>\n\nОтправь новый запрос или /stop.",
+        parse_mode="HTML",
+    )
+    await state.set_state(Form.comparing_models)

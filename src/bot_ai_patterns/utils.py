@@ -1,3 +1,4 @@
+import html
 from html.parser import HTMLParser
 
 
@@ -42,7 +43,7 @@ class _TelegramHTMLConverter(HTMLParser):
             self._parts.append("\n")
 
     def handle_data(self, data: str) -> None:
-        self._parts.append(data)
+        self._parts.append(html.escape(data))
 
     def result(self) -> str:
         return "".join(self._parts).strip()
