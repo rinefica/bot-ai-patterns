@@ -9,11 +9,13 @@ from aiogram.types import Message
 from bot_ai_patterns.agent import Agent
 from bot_ai_patterns.client import get_client
 from bot_ai_patterns.model_comparison import compare_models, format_summary
+from bot_ai_patterns.storage import JSONStorage
 from bot_ai_patterns.strategies import run as run_strategy
 from bot_ai_patterns.utils import html_to_telegram, sanitize
 
 router = Router()
 _client = get_client()
+_storage = JSONStorage()
 
 # Агент на каждого пользователя (user_id -> Agent)
 _agents: dict[int, Agent] = {}
@@ -27,7 +29,7 @@ class Form(StatesGroup):
 
 def _get_agent(user_id: int) -> Agent:
     if user_id not in _agents:
-        _agents[user_id] = Agent(_client)
+        _agents[user_id] = Agent(_client, user_id=user_id, storage=_storage)
     return _agents[user_id]
 
 
