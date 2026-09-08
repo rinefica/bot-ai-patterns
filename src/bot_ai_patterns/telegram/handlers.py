@@ -1,9 +1,12 @@
+import asyncio
+
 from aiogram import Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message
 
+from bot_ai_patterns.agent import Agent
 from bot_ai_patterns.client import get_client
 from bot_ai_patterns.model_comparison import compare_models, format_summary
 from bot_ai_patterns.strategies import run as run_strategy
@@ -12,20 +15,51 @@ from bot_ai_patterns.utils import html_to_telegram, sanitize
 router = Router()
 _client = get_client()
 
+# Агент на каждого пользователя (user_id -> Agent)
+_agents: dict[int, Agent] = {}
+
 
 class Form(StatesGroup):
     waiting_for_query = State()
     comparing_models = State()
+    chatting = State()
+
+
+def _get_agent(user_id: int) -> Agent:
+    if user_id not in _agents:
+        _agents[user_id] = Agent(_client)
+    return _agents[user_id]
 
 
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer(
-        "Привет! Отправь мне задачу — получишь 3 варианта ответа. /stop чтобы остановить.\n"
-        "/compare — сравнить модели разного уровня."
+        "Привет! Доступные режимы:\n"
+        "/chat — диалог с агентом (с памятью)\n"
+        "/reset — сбросить историю агента\n"
+        "/compare — сравнить модели разного уровня\n"
+        "/stop — завершить сессию\n\n"
+        "Или просто отправь задачу — получишь 3 варианта ответа."
     )
     await state.set_state(Form.waiting_for_query)
+
+
+@router.message(Command("chat"))
+async def cmd_chat(message: Message, state: FSMContext) -> None:
+    await state.set_state(Form.chatting)
+    await message.answer(
+        "Режим диалога активирован. Агент помнит контекст разговора.\n"
+        "/reset — сбросить историю, /stop — выйти."
+    )
+
+
+@router.message(Command("reset"))
+async def cmd_reset(message: Message) -> None:
+    user_id = message.from_user.id
+    if user_id in _agents:
+        _agents[user_id].reset()
+    await message.answer("История агента сброшена.")
 
 
 @router.message(Command("compare"))
@@ -38,6 +72,21 @@ async def cmd_compare(message: Message, state: FSMContext) -> None:
 async def cmd_stop(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer("Сессия завершена. Напиши /start чтобы начать снова.")
+
+
+@router.message(Form.chatting)
+async def handle_chat(message: Message) -> None:
+    user_input = sanitize(message.text or "")
+    if not user_input:
+        return
+
+    agent = _get_agent(message.from_user.id)
+    status = await message.answer("Думаю...")
+
+    reply = await asyncio.to_thread(agent.chat, user_input)
+
+    await status.delete()
+    await message.answer(reply)
 
 
 @router.message(Form.waiting_for_query)
@@ -88,7 +137,7 @@ async def handle_compare(message: Message, state: FSMContext) -> None:
 
     summary = format_summary(results)
     await message.answer(
-        f"<b>📊 Сравнение</b>\n<pre>{summary}</pre>\n\nОтправь новый запрос или /stop.",
+        f"<b>Сравнение</b>\n<pre>{summary}</pre>\n\nОтправь новый запрос или /stop.",
         parse_mode="HTML",
     )
     await state.set_state(Form.comparing_models)
