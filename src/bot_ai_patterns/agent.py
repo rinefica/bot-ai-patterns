@@ -4,12 +4,15 @@ from dataclasses import dataclass, field
 
 import openai
 
+from bot_ai_patterns.compressor import Compressor
 from bot_ai_patterns.config import (
+    COMPRESS_AFTER_N,
     CONTEXT_LIMIT,
     CONTEXT_WARN_THRESHOLD,
     MAIN_MODEL_PRICE_PER_1K,
     MAX_TOKENS,
     MODEL_URI,
+    RECENT_KEEP,
 )
 from bot_ai_patterns.storage import JSONStorage
 
@@ -20,7 +23,7 @@ _DEFAULT_SYSTEM = "Ты полезный ассистент."
 class TokenUsage:
     """Статистика токенов одного запроса."""
 
-    prompt_tokens: int       # токены входа (история + новый запрос)
+    prompt_tokens: int       # токены входа (контекст + новый запрос)
     completion_tokens: int   # токены ответа модели
     total_tokens: int        # сумма
 
@@ -47,8 +50,22 @@ class SessionStats:
         return self.total_tokens * MAIN_MODEL_PRICE_PER_1K / 1000
 
     def context_fill_pct(self, last_prompt_tokens: int) -> float:
-        """Процент заполненности контекстного окна текущим промптом."""
         return last_prompt_tokens / CONTEXT_LIMIT * 100
+
+
+@dataclass
+class CompressionStats:
+    """Статистика работы компрессора."""
+
+    compressions_done: int = 0       # сколько раз сжимали
+    messages_compressed: int = 0    # сколько всего сообщений сжато
+    tokens_before: int = 0          # prompt_tokens до последнего сжатия
+    tokens_after: int = 0           # prompt_tokens после последнего сжатия
+
+    @property
+    def tokens_saved(self) -> int:
+        """Токены сэкономленные последним сжатием."""
+        return max(0, self.tokens_before - self.tokens_after)
 
 
 class ContextOverflowError(Exception):
@@ -63,14 +80,14 @@ class ContextOverflowError(Exception):
 
 
 class Agent:
-    """Агент, инкапсулирующий логику общения с LLM.
+    """Агент с управлением контекстом через компрессию.
 
-    Хранит историю диалога в памяти и персистентно в JSON.
-    При создании загружает сохранённую историю — диалог продолжается
-    после перезапуска приложения.
+    Два режима:
+    - Обычный (use_compression=False): отправляет полную историю на каждый запрос.
+    - Компрессионный (use_compression=True): старые сообщения заменяются summary,
+      в контекст подставляются только последние RECENT_KEEP сообщений + резюме.
 
-    Считает токены по каждому запросу: входные (вся история), выходные (ответ),
-    суммарные. Предупреждает при приближении к лимиту контекста.
+    Полная история (_history) хранится всегда — для аудита и переключения режимов.
     """
 
     def __init__(
@@ -79,18 +96,26 @@ class Agent:
         user_id: int,
         storage: JSONStorage,
         system_prompt: str = _DEFAULT_SYSTEM,
+        use_compression: bool = False,
     ) -> None:
         self._client = client
         self._user_id = user_id
         self._storage = storage
         self._system_prompt = system_prompt
+        self._use_compression = use_compression
+        self._compressor = Compressor(client)
 
         saved = storage.load(user_id)
+        system_msg = {"role": "system", "content": system_prompt}
+
         self._history: list[dict[str, str]] = (
-            saved if saved else [{"role": "system", "content": system_prompt}]
+            saved["history"] if saved.get("history") else [system_msg]
         )
+        self._summary: str = saved.get("summary", "")
+        self._recent: list[dict[str, str]] = saved.get("recent", [])
 
         self._stats = SessionStats()
+        self._compress_stats = CompressionStats()
         self._last_usage: TokenUsage | None = None
 
     # ------------------------------------------------------------------
@@ -98,25 +123,28 @@ class Agent:
     # ------------------------------------------------------------------
 
     def chat(self, user_input: str) -> tuple[str, TokenUsage]:
-        """Отправить сообщение и получить ответ вместе со статистикой токенов.
-
-        Returns:
-            (reply, TokenUsage) — текст ответа и статистика текущего запроса.
+        """Отправить сообщение, получить ответ + статистику токенов.
 
         Raises:
-            ContextOverflowError: когда история превышает CONTEXT_LIMIT.
+            ContextOverflowError: когда контекст превышает CONTEXT_LIMIT.
         """
-        self._history.append({"role": "user", "content": user_input})
+        user_msg: dict[str, str] = {"role": "user", "content": user_input}
+        self._history.append(user_msg)
+        if self._use_compression:
+            self._recent.append(user_msg)
+
+        messages = self._build_messages()
 
         try:
             response = self._client.chat.completions.create(
                 model=MODEL_URI,
-                messages=self._history,
+                messages=messages,
                 max_tokens=MAX_TOKENS,
             )
         except openai.BadRequestError as exc:
-            # Убираем только что добавленное сообщение — состояние не меняем
             self._history.pop()
+            if self._use_compression:
+                self._recent.pop()
             raise exc
 
         usage = response.usage
@@ -126,24 +154,43 @@ class Agent:
             total_tokens=usage.total_tokens if usage else 0,
         )
 
-        # Проверяем, не переполнен ли контекст (по факту ответа)
         if token_usage.prompt_tokens > CONTEXT_LIMIT:
             self._history.pop()
+            if self._use_compression:
+                self._recent.pop()
             raise ContextOverflowError(token_usage.prompt_tokens)
 
         reply = response.choices[0].message.content or ""
-        self._history.append({"role": "assistant", "content": reply})
-        self._storage.save(self._user_id, self._history)
+        assistant_msg: dict[str, str] = {"role": "assistant", "content": reply}
+        self._history.append(assistant_msg)
 
+        if self._use_compression:
+            self._recent.append(assistant_msg)
+            self._maybe_compress(token_usage.prompt_tokens)
+
+        self._storage.save(
+            self._user_id,
+            self._history,
+            summary=self._summary,
+            recent=self._recent,
+        )
         self._stats.add(token_usage)
         self._last_usage = token_usage
 
         return reply, token_usage
 
+    def toggle_compression(self) -> bool:
+        """Переключить режим компрессии. Возвращает новое значение флага."""
+        self._use_compression = not self._use_compression
+        return self._use_compression
+
     def reset(self) -> None:
         self._history = [{"role": "system", "content": self._system_prompt}]
+        self._summary = ""
+        self._recent = []
         self._storage.delete(self._user_id)
         self._stats = SessionStats()
+        self._compress_stats = CompressionStats()
         self._last_usage = None
 
     # ------------------------------------------------------------------
@@ -151,8 +198,20 @@ class Agent:
     # ------------------------------------------------------------------
 
     @property
+    def compression_enabled(self) -> bool:
+        return self._use_compression
+
+    @property
+    def summary(self) -> str:
+        return self._summary
+
+    @property
     def stats(self) -> SessionStats:
         return self._stats
+
+    @property
+    def compress_stats(self) -> CompressionStats:
+        return self._compress_stats
 
     @property
     def last_usage(self) -> TokenUsage | None:
@@ -160,5 +219,40 @@ class Agent:
 
     @property
     def history_len(self) -> int:
-        """Число сообщений в истории (без системного)."""
+        """Число сообщений в полной истории (без системного)."""
         return max(0, len(self._history) - 1)
+
+    @property
+    def recent_len(self) -> int:
+        """Число сообщений в текущем 'окне' компрессионного режима."""
+        return len(self._recent)
+
+    # ------------------------------------------------------------------
+    # Private
+    # ------------------------------------------------------------------
+
+    def _build_messages(self) -> list[dict[str, str]]:
+        """Собрать контекст для отправки в API."""
+        if not self._use_compression or not self._summary:
+            return self._history
+
+        msgs: list[dict[str, str]] = [
+            {"role": "system", "content": self._system_prompt},
+            {"role": "system", "content": f"[Резюме предыдущего диалога]\n{self._summary}"},
+        ]
+        msgs.extend(self._recent)
+        return msgs
+
+    def _maybe_compress(self, prompt_tokens_before: int) -> None:
+        """Сжать историю если recent достиг порога COMPRESS_AFTER_N."""
+        if len(self._recent) < COMPRESS_AFTER_N:
+            return
+
+        to_compress = self._recent[:-RECENT_KEEP]
+        self._summary = self._compressor.summarize(to_compress, self._summary)
+        self._recent = self._recent[-RECENT_KEEP:]
+
+        self._compress_stats.compressions_done += 1
+        self._compress_stats.messages_compressed += len(to_compress)
+        self._compress_stats.tokens_before = prompt_tokens_before
+        # tokens_after будет обновлён после следующего запроса

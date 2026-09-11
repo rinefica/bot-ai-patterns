@@ -15,6 +15,12 @@ CONTEXT_WARN_THRESHOLD = int(CONTEXT_LIMIT * 0.8)
 # Цена основной модели (руб. за 1000 токенов)
 MAIN_MODEL_PRICE_PER_1K = 6.00
 
+# Управление контекстом через компрессию
+# Сжимать когда recent накапливает >= N сообщений (user+assistant)
+COMPRESS_AFTER_N = 10
+# Оставлять N последних сообщений "как есть" после сжатия
+RECENT_KEEP = 4
+
 
 def _uri(model: str) -> str:
     return f"gpt://{YANDEX_CLOUD_FOLDER}/{model}"

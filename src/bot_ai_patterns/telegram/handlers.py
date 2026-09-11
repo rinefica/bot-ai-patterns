@@ -8,7 +8,7 @@ from aiogram.types import Message
 
 from bot_ai_patterns.agent import Agent, ContextOverflowError
 from bot_ai_patterns.client import get_client
-from bot_ai_patterns.config import CONTEXT_LIMIT, CONTEXT_WARN_THRESHOLD
+from bot_ai_patterns.config import COMPRESS_AFTER_N, CONTEXT_LIMIT, CONTEXT_WARN_THRESHOLD, RECENT_KEEP
 from bot_ai_patterns.storage import JSONStorage
 from bot_ai_patterns.strategies import run as run_strategy
 from bot_ai_patterns.utils import html_to_telegram, sanitize
@@ -33,7 +33,6 @@ def _get_agent(user_id: int) -> Agent:
 
 
 def _token_bar(prompt_tokens: int) -> str:
-    """Визуальная полоса заполненности контекстного окна."""
     pct = prompt_tokens / CONTEXT_LIMIT
     filled = int(pct * 10)
     bar = "█" * filled + "░" * (10 - filled)
@@ -41,26 +40,44 @@ def _token_bar(prompt_tokens: int) -> str:
 
 
 def _format_token_stats(agent: Agent) -> str:
-    """Форматирует статистику токенов последнего запроса и всего диалога."""
+    """Форматирует блок статистики токенов + данные компрессии."""
     usage = agent.last_usage
     stats = agent.stats
-
     if not usage:
         return ""
 
     warn = ""
     if usage.prompt_tokens >= CONTEXT_WARN_THRESHOLD:
         remaining = CONTEXT_LIMIT - usage.prompt_tokens
-        warn = f"\n⚠️ Осталось ~{remaining} токенов до лимита контекста!"
+        warn = f"\n⚠️ Осталось ~{remaining} токенов до лимита!"
+
+    # Строка с режимом и данными компрессии
+    if agent.compression_enabled:
+        cs = agent.compress_stats
+        mode_line = f"Режим: СЖАТИЕ ON (каждые {COMPRESS_AFTER_N} сообщ., храним {RECENT_KEEP})\n"
+        compress_line = (
+            f"В контексте: {agent.recent_len} из {agent.history_len} сообщ.\n"
+            f"Сжатий: {cs.compressions_done}, сжато сообщ.: {cs.messages_compressed}\n"
+        )
+        if cs.tokens_saved > 0:
+            compress_line += f"Экономия (посл. сжатие): ~{cs.tokens_saved} токенов\n"
+        summary_line = f"Резюме: {'есть' if agent.summary else 'нет'}\n"
+    else:
+        mode_line = "Режим: полная история\n"
+        compress_line = f"В контексте: {agent.history_len} из {agent.history_len} сообщ.\n"
+        summary_line = ""
 
     return (
         f"\n\n<code>─── токены ───────────────────\n"
-        f"Запрос  (история): {usage.prompt_tokens:>6}\n"
-        f"Ответ   (модель):  {usage.completion_tokens:>6}\n"
-        f"Итого   (запрос):  {usage.total_tokens:>6}\n"
-        f"─── диалог ({stats.turns} реплик) ─────\n"
-        f"Потрачено токенов: {stats.total_tokens:>6}\n"
-        f"Стоимость (руб.):  {stats.cost_rub:>6.4f}\n"
+        f"{mode_line}"
+        f"Запрос  (контекст): {usage.prompt_tokens:>6}\n"
+        f"Ответ   (модель):   {usage.completion_tokens:>6}\n"
+        f"Итого   (запрос):   {usage.total_tokens:>6}\n"
+        f"─── диалог ({stats.turns} реплик) ──────\n"
+        f"{compress_line}"
+        f"{summary_line}"
+        f"Потрачено токенов:  {stats.total_tokens:>6}\n"
+        f"Стоимость (руб.):   {stats.cost_rub:>6.4f}\n"
         f"Контекст: {_token_bar(usage.prompt_tokens)}</code>"
         f"{warn}"
     )
@@ -70,8 +87,9 @@ def _format_token_stats(agent: Agent) -> str:
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer(
-        "Привет! Доступные режимы:\n"
-        "/chat — диалог с агентом (с памятью и подсчётом токенов)\n"
+        "Привет! Доступные команды:\n"
+        "/chat — диалог с агентом (полная история)\n"
+        "/compress — включить/выключить сжатие истории\n"
         "/reset — сбросить историю агента\n"
         "/stop — завершить сессию\n\n"
         "Или просто отправь задачу — получишь 3 варианта ответа."
@@ -85,11 +103,34 @@ async def cmd_chat(message: Message, state: FSMContext) -> None:
     agent = _get_agent(message.from_user.id)
     stats = agent.stats
     turns_info = f" (продолжаем, {stats.turns} реплик в памяти)" if stats.turns > 0 else ""
+    mode = "СЖАТИЕ ON" if agent.compression_enabled else "полная история"
     await message.answer(
         f"Режим диалога активирован{turns_info}.\n"
+        f"Текущий режим контекста: <b>{mode}</b>\n"
         "После каждого ответа показываю статистику токенов.\n"
-        "/reset — сбросить историю, /stop — выйти."
+        "/compress — переключить сжатие, /reset — сбросить историю, /stop — выйти.",
+        parse_mode="HTML",
     )
+
+
+@router.message(Command("compress"))
+async def cmd_compress(message: Message) -> None:
+    agent = _get_agent(message.from_user.id)
+    enabled = agent.toggle_compression()
+    mode = "включено" if enabled else "выключено"
+    icon = "✅" if enabled else "❌"
+
+    details = ""
+    if enabled:
+        details = (
+            f"\n\nСжатие срабатывает после каждых {COMPRESS_AFTER_N} сообщений.\n"
+            f"В контексте остаётся последние {RECENT_KEEP} сообщения + резюме.\n"
+            f"Это уменьшает prompt_tokens и стоимость запроса."
+        )
+    else:
+        details = "\n\nАгент снова отправляет полную историю на каждый запрос."
+
+    await message.answer(f"{icon} Сжатие истории <b>{mode}</b>.{details}", parse_mode="HTML")
 
 
 @router.message(Command("reset"))
@@ -98,7 +139,6 @@ async def cmd_reset(message: Message) -> None:
     if user_id in _agents:
         _agents[user_id].reset()
     await message.answer("История агента сброшена.")
-
 
 
 @router.message(Command("stop"))
@@ -114,7 +154,8 @@ async def handle_chat(message: Message) -> None:
         return
 
     agent = _get_agent(message.from_user.id)
-    status = await message.answer("Думаю...")
+    status_text = "Думаю (сжимаю контекст)..." if agent.compression_enabled else "Думаю..."
+    status = await message.answer(status_text)
 
     try:
         reply, _usage = await asyncio.to_thread(agent.chat, user_input)
@@ -123,7 +164,7 @@ async def handle_chat(message: Message) -> None:
         await message.answer(
             f"<b>Контекст переполнен!</b>\n\n"
             f"История занимает {exc.prompt_tokens} токенов при лимите {CONTEXT_LIMIT}.\n"
-            f"Используй /reset чтобы начать новый диалог.",
+            f"Попробуй /compress для сжатия или /reset для сброса.",
             parse_mode="HTML",
         )
         return
@@ -156,5 +197,3 @@ async def handle_query(message: Message, state: FSMContext) -> None:
 
     await message.answer("Отправь новый запрос или /stop для завершения.")
     await state.set_state(Form.waiting_for_query)
-
-
