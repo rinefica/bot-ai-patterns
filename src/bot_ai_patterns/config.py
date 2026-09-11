@@ -5,6 +5,16 @@ MODEL_URI = f"gpt://{YANDEX_CLOUD_FOLDER}/{YANDEX_CLOUD_MODEL}"
 MAX_TOKENS = 1024
 MAX_RETRIES = 3
 
+# Лимит контекста YandexGPT-5-Pro (токены)
+# При превышении API вернёт ошибку или усечёт историю
+CONTEXT_LIMIT = 8192
+
+# Порог предупреждения — 80% от лимита
+CONTEXT_WARN_THRESHOLD = int(CONTEXT_LIMIT * 0.8)
+
+# Цена основной модели (руб. за 1000 токенов)
+MAIN_MODEL_PRICE_PER_1K = 6.00
+
 
 def _uri(model: str) -> str:
     return f"gpt://{YANDEX_CLOUD_FOLDER}/{model}"
