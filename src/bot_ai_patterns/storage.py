@@ -5,18 +5,18 @@ HISTORY_DIR = Path("data/history")
 
 
 class JSONStorage:
-    """Хранилище истории диалогов в JSON-файлах.
+    """Хранилище состояния агента в JSON-файлах.
 
-    Каждый пользователь — отдельный файл data/history/{user_id}.json.
-
-    Формат файла (v2):
+    Формат (v3):
     {
-        "history": [...],   # полная история (все сообщения)
-        "summary": "...",   # резюме сжатых сообщений (пусто если нет компрессии)
-        "recent":  [...]    # последние N сообщений для компрессионного режима
+        "strategy_name":  "sliding_window",
+        "strategy_state": {...},   # состояние стратегии
+        "all_messages":   [...]    # аудит-лог всех сообщений (без системного)
     }
 
-    Поддерживает старый формат v1 (просто список) для обратной совместимости.
+    Старые форматы:
+    - v1: список сообщений → преобразуется в v3
+    - v2: dict с history/summary/recent → преобразуется в v3
     """
 
     def __init__(self, history_dir: Path = HISTORY_DIR) -> None:
@@ -27,33 +27,40 @@ class JSONStorage:
         return self._dir / f"{user_id}.json"
 
     def load(self, user_id: int) -> dict:
-        """Вернуть сохранённые данные.
+        """Загрузить сохранённое состояние агента.
 
         Returns:
-            dict с ключами 'history', 'summary', 'recent'.
+            dict с ключами strategy_name, strategy_state, all_messages.
             Пустой dict если файла нет.
         """
         path = self._path(user_id)
         if not path.exists():
             return {}
         raw = json.loads(path.read_text(encoding="utf-8"))
-        # Обратная совместимость: старый формат — просто список сообщений
+
+        # Backward compat: v1 — просто список сообщений
         if isinstance(raw, list):
-            return {"history": raw, "summary": "", "recent": []}
+            return {"strategy_name": None, "strategy_state": None, "all_messages": raw}
+
+        # Backward compat: v2 — dict с history/summary/recent (day9)
+        if "history" in raw and "strategy_name" not in raw:
+            all_msgs = [m for m in raw.get("history", []) if m.get("role") != "system"]
+            return {"strategy_name": None, "strategy_state": None, "all_messages": all_msgs}
+
         return raw
 
     def save(
         self,
         user_id: int,
-        history: list[dict[str, str]],
         *,
-        summary: str = "",
-        recent: list[dict[str, str]] | None = None,
+        strategy_name: str,
+        strategy_state: dict,
+        all_messages: list[dict[str, str]],
     ) -> None:
         data = {
-            "history": history,
-            "summary": summary,
-            "recent": recent or [],
+            "strategy_name": strategy_name,
+            "strategy_state": strategy_state,
+            "all_messages": all_messages,
         }
         self._path(user_id).write_text(
             json.dumps(data, ensure_ascii=False, indent=2),

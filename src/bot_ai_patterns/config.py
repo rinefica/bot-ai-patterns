@@ -15,11 +15,11 @@ CONTEXT_WARN_THRESHOLD = int(CONTEXT_LIMIT * 0.8)
 # Цена основной модели (руб. за 1000 токенов)
 MAIN_MODEL_PRICE_PER_1K = 6.00
 
-# Управление контекстом через компрессию
-# Сжимать когда recent накапливает >= N сообщений (user+assistant)
-COMPRESS_AFTER_N = 10
-# Оставлять N последних сообщений "как есть" после сжатия
-RECENT_KEEP = 4
+# Стратегии управления контекстом
+# Sliding Window: число сообщений в скользящем окне
+WINDOW_SIZE = 6
+# Sticky Facts: размер окна последних сообщений + блок фактов
+FACTS_WINDOW_SIZE = 6
 
 
 def _uri(model: str) -> str:
