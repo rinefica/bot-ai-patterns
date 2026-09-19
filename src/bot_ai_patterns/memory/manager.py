@@ -1,9 +1,10 @@
-"""MemoryManager — объединяет три слоя памяти.
+"""MemoryManager — объединяет три слоя памяти и состояние задачи.
 
 Слои:
   STM (Short-Term Memory)  — текущий диалог, управляется ContextStrategy
   WM  (Working Memory)     — данные текущей задачи, авто-экстракция, сбрасывается с /reset
   LTM (Long-Term Memory)   — профиль/решения/знания, персистентная между сессиями
+  Task FSM                 — этап/шаг/действие задачи, персистентная
 """
 from __future__ import annotations
 
@@ -13,15 +14,18 @@ from bot_ai_patterns.context_strategies.base import ContextStrategy
 from bot_ai_patterns.memory.long_term_memory import LongTermMemory
 from bot_ai_patterns.memory.user_profile import UserProfile
 from bot_ai_patterns.memory.working_memory import WorkingMemory
+from bot_ai_patterns.task.task_manager import TaskManager
 
 
 class MemoryManager:
-    """Управляет WM и LTM, инжектирует их в контекст поверх STM.
+    """Управляет WM, LTM, профилем и FSM задачи; инжектирует всё в контекст.
 
     Финальный порядок сообщений в запросе к API:
       [system_prompt]
-      [LTM блок]      ← долговременная память, если непуста
-      [WM блок]       ← рабочая память, если непуста
+      [Профиль]       ← инструкции по стилю
+      [Задача FSM]    ← этап, шаг, ожидаемое действие
+      [LTM блок]      ← долговременная память
+      [WM блок]       ← рабочая память (авто-экстракция)
       [...STM msgs]   ← последние N сообщений диалога (стратегия)
     """
 
@@ -30,6 +34,7 @@ class MemoryManager:
         self.wm = WorkingMemory(client)
         self.ltm = LongTermMemory(user_id)
         self.profile = UserProfile(self.ltm)
+        self.task = TaskManager(user_id)
 
     def build_messages(
         self, strategy: ContextStrategy, system_prompt: str
@@ -48,12 +53,17 @@ class MemoryManager:
         if profile_block:
             result.append({"role": "system", "content": profile_block})
 
-        # 2. LTM — решения и знания из прошлых сессий
+        # 2. Состояние задачи (FSM) — этап, шаг, ожидаемое действие
+        task_block = self.task.format_context_block()
+        if task_block:
+            result.append({"role": "system", "content": task_block})
+
+        # 3. LTM — решения и знания из прошлых сессий
         ltm_block = self.ltm.format_block()
         if ltm_block:
             result.append({"role": "system", "content": ltm_block})
 
-        # 3. WM — данные текущей задачи
+        # 4. WM — данные текущей задачи (авто-экстракция)
         wm_block = self.wm.format_block()
         if wm_block:
             result.append({"role": "system", "content": wm_block})

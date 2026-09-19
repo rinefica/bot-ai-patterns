@@ -98,6 +98,11 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         "/strategy — переключить стратегию контекста\n"
         "/reset — сбросить историю (LTM сохраняется)\n"
         "/stop — завершить сессию\n\n"
+        "Задача (FSM):\n"
+        "/task — состояние задачи\n"
+        "/task new &lt;название&gt; — создать задачу\n"
+        "/task advance — следующий этап\n"
+        "/task pause / resume — пауза / продолжить\n\n"
         "Профиль и память:\n"
         "/profile — просмотр/редактирование профиля\n"
         "/memory — показать все слои памяти\n"
@@ -461,6 +466,141 @@ async def cmd_forget(message: Message) -> None:
             f"Ключ <code>{key}</code> не найден в категории [{category}].",
             parse_mode="HTML",
         )
+
+
+# ---------------------------------------------------------------------------
+# Команды управления задачей (FSM)
+# ---------------------------------------------------------------------------
+
+from bot_ai_patterns.task.task_state import STAGE_ORDER, STAGE_LABELS  # noqa: E402
+
+_TASK_HELP = (
+    "<b>Управление задачей:</b>\n\n"
+    "  /task — показать состояние\n"
+    "  /task new &lt;название&gt; — создать задачу\n"
+    "  /task advance — следующий этап\n"
+    "  /task step &lt;описание&gt; — установить текущий шаг\n"
+    "  /task action &lt;описание&gt; — установить ожидаемое действие\n"
+    "  /task note &lt;заметка&gt; — добавить заметку\n"
+    "  /task pause — поставить на паузу\n"
+    "  /task resume — возобновить (агент продолжит без повторений)\n"
+    "  /task clear — удалить задачу\n\n"
+    f"Этапы: {' → '.join(STAGE_LABELS[s] for s in STAGE_ORDER)}"
+)
+
+
+@router.message(Command("task"))
+async def cmd_task(message: Message) -> None:
+    parts = (message.text or "").split(maxsplit=2)
+    agent = _get_agent(message.from_user.id)
+    tm = agent.memory.task
+
+    # /task — показать состояние
+    if len(parts) == 1:
+        await message.answer(tm.format_telegram(), parse_mode="HTML")
+        return
+
+    sub = parts[1].strip().lower()
+    arg = parts[2].strip() if len(parts) > 2 else ""
+
+    # /task new <название>
+    if sub == "new":
+        if not arg:
+            await message.answer("Укажи название: /task new &lt;название&gt;", parse_mode="HTML")
+            return
+        task = tm.create(arg)
+        await message.answer(
+            f"Задача создана: <b>{task.title}</b>\n"
+            f"Этап: <b>{task.stage_label}</b>\n\n"
+            "Теперь диалог с агентом будет вестись в контексте этой задачи.\n"
+            "Используй /task advance для перехода на следующий этап.",
+            parse_mode="HTML",
+        )
+        return
+
+    # /task advance
+    if sub == "advance":
+        if not tm.has_task:
+            await message.answer("Нет активной задачи. Создай командой /task new.")
+            return
+        old_stage = tm.task.stage_label
+        if tm.advance():
+            await message.answer(
+                f"Переход: <b>{old_stage}</b> → <b>{tm.task.stage_label}</b>\n\n"
+                + tm.format_telegram(),
+                parse_mode="HTML",
+            )
+        else:
+            await message.answer("Задача уже завершена (done).")
+        return
+
+    # /task step <описание>
+    if sub == "step":
+        if not arg:
+            await message.answer("Укажи шаг: /task step &lt;описание&gt;", parse_mode="HTML")
+            return
+        if not tm.has_task:
+            await message.answer("Нет активной задачи.")
+            return
+        tm.set_step(arg)
+        await message.answer(f"Текущий шаг: <b>{arg}</b>", parse_mode="HTML")
+        return
+
+    # /task action <описание>
+    if sub == "action":
+        if not arg:
+            await message.answer("Укажи действие: /task action &lt;описание&gt;", parse_mode="HTML")
+            return
+        if not tm.has_task:
+            await message.answer("Нет активной задачи.")
+            return
+        tm.set_action(arg)
+        await message.answer(f"Ожидаемое действие: <b>{arg}</b>", parse_mode="HTML")
+        return
+
+    # /task note <заметка>
+    if sub == "note":
+        if not arg:
+            await message.answer("Укажи заметку: /task note &lt;текст&gt;", parse_mode="HTML")
+            return
+        if not tm.has_task:
+            await message.answer("Нет активной задачи.")
+            return
+        tm.add_note(arg)
+        await message.answer(f"Заметка добавлена: {arg}")
+        return
+
+    # /task pause
+    if sub == "pause":
+        if tm.pause():
+            await message.answer(
+                "Задача поставлена на паузу.\n"
+                "Возобнови командой /task resume — агент продолжит с текущего шага."
+            )
+        else:
+            await message.answer("Нет активной задачи.")
+        return
+
+    # /task resume
+    if sub == "resume":
+        if tm.resume():
+            await message.answer(
+                "Задача возобновлена.\n\n"
+                + tm.format_telegram()
+                + "\n\nОтправь сообщение — агент продолжит без повторений.",
+                parse_mode="HTML",
+            )
+        else:
+            await message.answer("Нет активной задачи.")
+        return
+
+    # /task clear
+    if sub == "clear":
+        tm.clear()
+        await message.answer("Задача удалена.")
+        return
+
+    await message.answer(_TASK_HELP, parse_mode="HTML")
 
 
 @router.message(Command("stop"))
