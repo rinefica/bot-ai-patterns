@@ -11,6 +11,7 @@ import openai
 
 from bot_ai_patterns.context_strategies.base import ContextStrategy
 from bot_ai_patterns.memory.long_term_memory import LongTermMemory
+from bot_ai_patterns.memory.user_profile import UserProfile
 from bot_ai_patterns.memory.working_memory import WorkingMemory
 
 
@@ -28,6 +29,7 @@ class MemoryManager:
         self._client = client
         self.wm = WorkingMemory(client)
         self.ltm = LongTermMemory(user_id)
+        self.profile = UserProfile(self.ltm)
 
     def build_messages(
         self, strategy: ContextStrategy, system_prompt: str
@@ -40,12 +42,22 @@ class MemoryManager:
             return base
 
         result = [base[0]]
+
+        # 1. Профиль — первым: явные инструкции по стилю для каждого ответа
+        profile_block = self.profile.format_system_block()
+        if profile_block:
+            result.append({"role": "system", "content": profile_block})
+
+        # 2. LTM — решения и знания из прошлых сессий
         ltm_block = self.ltm.format_block()
         if ltm_block:
             result.append({"role": "system", "content": ltm_block})
+
+        # 3. WM — данные текущей задачи
         wm_block = self.wm.format_block()
         if wm_block:
             result.append({"role": "system", "content": wm_block})
+
         result.extend(base[1:])
         return result
 
@@ -63,17 +75,41 @@ class MemoryManager:
 
     def format_telegram(self) -> str:
         """Отчёт о всех слоях памяти для Telegram."""
-        wm_lines = []
+        sections = []
+
+        # STM — краткая сводка
+        sections.append("<b>STM (краткосрочная):</b> текущий диалог, управляется стратегией")
+
+        # WM
         if self.wm.data:
-            wm_lines.append("<b>Рабочая память (текущая задача):</b>")
+            wm_lines = ["<b>WM (рабочая память — текущая задача):</b>"]
             for k, v in self.wm.data.items():
                 wm_lines.append(f"  • <code>{k}</code>: {v}")
+            sections.append("\n".join(wm_lines))
         else:
-            wm_lines.append("<b>Рабочая память:</b> пуста")
+            sections.append("<b>WM (рабочая память):</b> пуста")
 
-        ltm_text = self.ltm.format_telegram()
+        # LTM (без profile — он отдельно)
+        ltm_data = self.ltm.get_all()
+        ltm_no_profile = {
+            cat: d for cat, d in ltm_data.items() if cat != "profile"
+        }
+        if any(ltm_no_profile.values()):
+            ltm_lines = ["<b>LTM (долговременная память):</b>"]
+            labels = {"decisions": "Решения", "knowledge": "Знания"}
+            for cat, items in ltm_no_profile.items():
+                if items:
+                    ltm_lines.append(f"  <i>{labels.get(cat, cat)}:</i>")
+                    for k, v in items.items():
+                        ltm_lines.append(f"    • <code>{k}</code>: {v}")
+            sections.append("\n".join(ltm_lines))
+        else:
+            sections.append("<b>LTM (долговременная память):</b> пуста")
 
-        return "\n".join(wm_lines) + "\n\n" + ltm_text
+        # Профиль отдельным блоком
+        sections.append(self.profile.format_telegram())
+
+        return "\n\n".join(sections)
 
     # ------------------------------------------------------------------
     # Persistence helpers (WM only — LTM persists itself)

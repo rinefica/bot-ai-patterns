@@ -58,13 +58,13 @@ class TestMemoryManager:
 
     def test_build_messages_order(self):
         mgr = _manager()
-        mgr.ltm.set("profile", "язык", "Python")
+        mgr.ltm.set("decisions", "стек", "FastAPI")  # LTM без profile
         mgr.wm.set("задача", "API")
         strategy = SlidingWindowStrategy()
         strategy.add_user("q")
         msgs = mgr.build_messages(strategy, "sys")
         system_msgs = [m for m in msgs if m["role"] == "system"]
-        assert len(system_msgs) == 3  # system_prompt + LTM + WM
+        assert len(system_msgs) == 3  # system_prompt + LTM + WM (профиль пуст)
         assert "Долговременная" in system_msgs[1]["content"]
         assert "Рабочая" in system_msgs[2]["content"]
 
@@ -79,11 +79,13 @@ class TestMemoryManager:
     def test_format_telegram_shows_both_layers(self):
         mgr = _manager()
         mgr.wm.set("задача", "маркетплейс")
-        mgr.ltm.set("profile", "уровень", "senior")
+        mgr.ltm.set("decisions", "стек", "FastAPI")
+        mgr.profile.set("уровень", "senior")
         text = mgr.format_telegram()
-        assert "Рабочая память" in text
-        assert "Долговременная" in text
+        assert "WM" in text
+        assert "LTM" in text
         assert "маркетплейс" in text
+        assert "FastAPI" in text
         assert "senior" in text
 
     def test_wm_state_roundtrip(self):
@@ -101,3 +103,34 @@ class TestMemoryManager:
         mgr.after_exchange("пишу API", "хорошо")
         # LLM был вызван для WM и LTM экстракции
         assert client.chat.completions.create.call_count == 2
+
+    def test_profile_block_injected_before_ltm(self):
+        mgr = _manager()
+        mgr.profile.set("стиль", "кратко")
+        mgr.ltm.set("decisions", "стек", "FastAPI")
+        strategy = SlidingWindowStrategy()
+        strategy.add_user("вопрос")
+        msgs = mgr.build_messages(strategy, "sys")
+        system_msgs = [m for m in msgs if m["role"] == "system"]
+        # Порядок: system_prompt → profile → ltm
+        assert "Профиль" in system_msgs[1]["content"]
+        assert "Долговременная" in system_msgs[2]["content"]
+
+    def test_profile_block_not_injected_when_empty(self):
+        mgr = _manager()
+        strategy = SlidingWindowStrategy()
+        strategy.add_user("вопрос")
+        msgs = mgr.build_messages(strategy, "sys")
+        system_contents = [m["content"] for m in msgs if m["role"] == "system"]
+        assert not any("Профиль" in c for c in system_contents)
+
+    def test_format_telegram_shows_all_layers(self):
+        mgr = _manager()
+        mgr.wm.set("задача", "API")
+        mgr.ltm.set("decisions", "стек", "FastAPI")
+        mgr.profile.set("стиль", "кратко")
+        text = mgr.format_telegram()
+        assert "STM" in text
+        assert "WM" in text
+        assert "LTM" in text
+        assert "Профиль" in text

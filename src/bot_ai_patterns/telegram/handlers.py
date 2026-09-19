@@ -98,7 +98,8 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         "/strategy — переключить стратегию контекста\n"
         "/reset — сбросить историю (LTM сохраняется)\n"
         "/stop — завершить сессию\n\n"
-        "Память:\n"
+        "Профиль и память:\n"
+        "/profile — просмотр/редактирование профиля\n"
         "/memory — показать все слои памяти\n"
         "/remember &lt;категория&gt; &lt;ключ&gt;: &lt;значение&gt; — добавить в LTM\n"
         "/forget &lt;категория&gt; &lt;ключ&gt; — удалить из LTM\n\n"
@@ -301,6 +302,92 @@ async def cmd_reset(message: Message) -> None:
         "История диалога и рабочая память сброшены.\n"
         "Долговременная память (LTM) сохранена — используй /memory для просмотра.",
     )
+
+
+# ---------------------------------------------------------------------------
+# Профиль пользователя
+# ---------------------------------------------------------------------------
+
+from bot_ai_patterns.memory.user_profile import PRESETS  # noqa: E402
+
+_PROFILE_HELP = (
+    "<b>Управление профилем:</b>\n\n"
+    "  /profile — показать профиль\n"
+    "  /profile set &lt;поле&gt; &lt;значение&gt; — установить поле\n"
+    "  /profile clear — очистить весь профиль\n"
+    "  /profile clear &lt;поле&gt; — удалить одно поле\n"
+    f"  /profile preset [{' | '.join(PRESETS)}] — применить пресет\n\n"
+    "Стандартные поля: <code>имя</code>, <code>стиль</code>, <code>формат</code>, "
+    "<code>уровень</code>, <code>стек</code>, <code>ограничения</code>, <code>язык</code>"
+)
+
+
+@router.message(Command("profile"))
+async def cmd_profile(message: Message) -> None:
+    parts = (message.text or "").split(maxsplit=2)
+    agent = _get_agent(message.from_user.id)
+    profile = agent.memory.profile
+
+    # /profile — просмотр
+    if len(parts) == 1:
+        await message.answer(profile.format_telegram(), parse_mode="HTML")
+        return
+
+    sub = parts[1].strip().lower()
+
+    # /profile set <поле> <значение>
+    if sub == "set":
+        if len(parts) < 3 or not parts[2].strip():
+            await message.answer(_PROFILE_HELP, parse_mode="HTML")
+            return
+        rest = parts[2].strip()
+        # "поле значение" — первое слово = поле, остальное = значение
+        field_parts = rest.split(maxsplit=1)
+        if len(field_parts) < 2:
+            await message.answer(
+                "Формат: /profile set &lt;поле&gt; &lt;значение&gt;", parse_mode="HTML"
+            )
+            return
+        field, value = field_parts[0].lower(), field_parts[1]
+        profile.set(field, value)
+        await message.answer(
+            f"Профиль обновлён:\n<code>{field}</code>: {value}\n\n"
+            "Это предпочтение будет применяться к каждому ответу.",
+            parse_mode="HTML",
+        )
+        return
+
+    # /profile preset <имя>
+    if sub == "preset":
+        preset_name = parts[2].strip().lower() if len(parts) > 2 else ""
+        if not preset_name or not profile.apply_preset(preset_name):
+            available = ", ".join(f"<code>{p}</code>" for p in PRESETS)
+            await message.answer(
+                f"Доступные пресеты: {available}", parse_mode="HTML"
+            )
+            return
+        await message.answer(
+            f"Пресет <b>{preset_name}</b> применён.\n\n"
+            + profile.format_telegram(),
+            parse_mode="HTML",
+        )
+        return
+
+    # /profile clear [поле]
+    if sub == "clear":
+        if len(parts) > 2:
+            field = parts[2].strip().lower()
+            if profile.remove(field):
+                await message.answer(f"Поле <code>{field}</code> удалено.", parse_mode="HTML")
+            else:
+                await message.answer(f"Поле <code>{field}</code> не найдено.", parse_mode="HTML")
+        else:
+            profile.clear()
+            await message.answer("Профиль очищен.")
+        return
+
+    # Неизвестная подкоманда
+    await message.answer(_PROFILE_HELP, parse_mode="HTML")
 
 
 # ---------------------------------------------------------------------------
