@@ -11,6 +11,7 @@ from __future__ import annotations
 import openai
 
 from bot_ai_patterns.context_strategies.base import ContextStrategy
+from bot_ai_patterns.invariants.invariants import InvariantsStore
 from bot_ai_patterns.memory.long_term_memory import LongTermMemory
 from bot_ai_patterns.memory.user_profile import UserProfile
 from bot_ai_patterns.memory.working_memory import WorkingMemory
@@ -22,6 +23,7 @@ class MemoryManager:
 
     Финальный порядок сообщений в запросе к API:
       [system_prompt]
+      [Инварианты]    ← НЕЛЬЗЯ НАРУШАТЬ — наивысший приоритет
       [Профиль]       ← инструкции по стилю
       [Задача FSM]    ← этап, шаг, ожидаемое действие
       [LTM блок]      ← долговременная память
@@ -35,6 +37,7 @@ class MemoryManager:
         self.ltm = LongTermMemory(user_id)
         self.profile = UserProfile(self.ltm)
         self.task = TaskManager(user_id)
+        self.invariants = InvariantsStore(user_id)
 
     def build_messages(
         self, strategy: ContextStrategy, system_prompt: str
@@ -48,7 +51,12 @@ class MemoryManager:
 
         result = [base[0]]
 
-        # 1. Профиль — первым: явные инструкции по стилю для каждого ответа
+        # 0. Инварианты — наивысший приоритет: нельзя нарушать
+        inv_block = self.invariants.format_context_block()
+        if inv_block:
+            result.append({"role": "system", "content": inv_block})
+
+        # 1. Профиль — явные инструкции по стилю для каждого ответа
         profile_block = self.profile.format_system_block()
         if profile_block:
             result.append({"role": "system", "content": profile_block})
@@ -118,6 +126,9 @@ class MemoryManager:
 
         # Профиль отдельным блоком
         sections.append(self.profile.format_telegram())
+
+        # Инварианты
+        sections.append(self.invariants.format_telegram())
 
         return "\n\n".join(sections)
 

@@ -98,6 +98,10 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         "/strategy — переключить стратегию контекста\n"
         "/reset — сбросить историю (LTM сохраняется)\n"
         "/stop — завершить сессию\n\n"
+        "Инварианты:\n"
+        "/invariant — список инвариантов\n"
+        "/invariant add &lt;категория&gt; &lt;описание&gt; — добавить\n"
+        "/invariant remove &lt;id&gt; — удалить\n\n"
         "Задача (FSM):\n"
         "/task — состояние задачи\n"
         "/task new &lt;название&gt; — создать задачу\n"
@@ -466,6 +470,89 @@ async def cmd_forget(message: Message) -> None:
             f"Ключ <code>{key}</code> не найден в категории [{category}].",
             parse_mode="HTML",
         )
+
+
+# ---------------------------------------------------------------------------
+# Инварианты
+# ---------------------------------------------------------------------------
+
+from bot_ai_patterns.invariants.invariants import CATEGORIES, CATEGORY_ALIASES  # noqa: E402
+
+_INVARIANT_HELP = (
+    "<b>Инварианты — ограничения, которые нельзя нарушать:</b>\n\n"
+    "  /invariant — показать все\n"
+    "  /invariant add &lt;категория&gt; &lt;описание&gt; — добавить\n"
+    "  /invariant remove &lt;id&gt; — удалить по номеру\n"
+    "  /invariant clear — удалить все\n\n"
+    "Категории: <code>arch</code>, <code>tech</code>, <code>stack</code>, <code>biz</code>\n\n"
+    "Примеры:\n"
+    "  <code>/invariant add arch монолит на FastAPI — не предлагать микросервисы</code>\n"
+    "  <code>/invariant add stack только Python — без Go и Java</code>\n"
+    "  <code>/invariant add biz данные хранятся только в EU</code>"
+)
+
+
+@router.message(Command("invariant"))
+async def cmd_invariant(message: Message) -> None:
+    parts = (message.text or "").split(maxsplit=2)
+    agent = _get_agent(message.from_user.id)
+    store = agent.memory.invariants
+
+    # /invariant — показать список
+    if len(parts) == 1:
+        await message.answer(store.format_telegram(), parse_mode="HTML")
+        return
+
+    sub = parts[1].strip().lower()
+    arg = parts[2].strip() if len(parts) > 2 else ""
+
+    # /invariant add <category> <description>
+    if sub == "add":
+        if not arg:
+            await message.answer(_INVARIANT_HELP, parse_mode="HTML")
+            return
+        cat_arg, _, description = arg.partition(" ")
+        description = description.strip()
+        if not description:
+            await message.answer(
+                "Формат: /invariant add &lt;категория&gt; &lt;описание&gt;",
+                parse_mode="HTML",
+            )
+            return
+        try:
+            inv = store.add(cat_arg, description)
+        except ValueError as exc:
+            await message.answer(str(exc), parse_mode="HTML")
+            return
+        cat_label = CATEGORIES.get(inv.category, inv.category)
+        await message.answer(
+            f"Инвариант <code>[{inv.id}]</code> добавлен.\n"
+            f"<b>Категория:</b> {cat_label}\n"
+            f"<b>Описание:</b> {inv.description}\n\n"
+            "Теперь ассистент будет явно учитывать его в каждом ответе "
+            "и откажется предлагать решения, нарушающие это ограничение.",
+            parse_mode="HTML",
+        )
+        return
+
+    # /invariant remove <id>
+    if sub == "remove":
+        if not arg.isdigit():
+            await message.answer("Укажи числовой ID: /invariant remove &lt;id&gt;", parse_mode="HTML")
+            return
+        if store.remove(int(arg)):
+            await message.answer(f"Инвариант <code>[{arg}]</code> удалён.", parse_mode="HTML")
+        else:
+            await message.answer(f"Инвариант <code>[{arg}]</code> не найден.", parse_mode="HTML")
+        return
+
+    # /invariant clear
+    if sub == "clear":
+        store.clear()
+        await message.answer("Все инварианты удалены.")
+        return
+
+    await message.answer(_INVARIANT_HELP, parse_mode="HTML")
 
 
 # ---------------------------------------------------------------------------
