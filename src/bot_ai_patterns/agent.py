@@ -12,6 +12,7 @@ from bot_ai_patterns.config import (
     MODEL_URI,
 )
 from bot_ai_patterns.context_strategies import ContextStrategy, SlidingWindowStrategy
+from bot_ai_patterns.memory.manager import MemoryManager
 from bot_ai_patterns.storage import JSONStorage
 
 _DEFAULT_SYSTEM = "Ты полезный ассистент."
@@ -84,6 +85,9 @@ class Agent:
         self._system_prompt = system_prompt
         self._strategy: ContextStrategy = strategy or SlidingWindowStrategy()
 
+        # Трёхуровневая модель памяти
+        self._memory = MemoryManager(client, user_id)
+
         # Аудит-лог: все сообщения за сессию (без системного)
         self._all_messages: list[dict[str, str]] = []
 
@@ -95,6 +99,9 @@ class Agent:
                 self._strategy.load_state(strategy_state)
             elif self._all_messages:
                 self._strategy.init_from_messages(self._all_messages)
+            wm_state = saved.get("wm_state")
+            if wm_state:
+                self._memory.load_wm_state(wm_state)
 
         self._stats = SessionStats()
         self._last_usage: TokenUsage | None = None
@@ -112,7 +119,7 @@ class Agent:
         self._strategy.add_user(user_input)
         self._all_messages.append({"role": "user", "content": user_input})
 
-        messages = self._strategy.build_messages(self._system_prompt)
+        messages = self._memory.build_messages(self._strategy, self._system_prompt)
 
         try:
             response = self._client.chat.completions.create(
@@ -146,7 +153,9 @@ class Agent:
             strategy_name=self._strategy.name,
             strategy_state=self._strategy.get_state(),
             all_messages=self._all_messages,
+            wm_state=self._memory.get_wm_state(),
         )
+        self._memory.after_exchange(user_input, reply)
         self._stats.add(token_usage)
         self._last_usage = token_usage
 
@@ -159,6 +168,7 @@ class Agent:
 
     def reset(self) -> None:
         self._strategy.reset()
+        self._memory.reset()  # WM сбрасывается, LTM — нет
         self._all_messages = []
         self._storage.delete(self._user_id)
         self._stats = SessionStats()
@@ -171,6 +181,10 @@ class Agent:
     @property
     def strategy(self) -> ContextStrategy:
         return self._strategy
+
+    @property
+    def memory(self) -> MemoryManager:
+        return self._memory
 
     @property
     def stats(self) -> SessionStats:

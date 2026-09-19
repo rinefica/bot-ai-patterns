@@ -52,7 +52,10 @@ def _make_agent(
     if client is None:
         client = MagicMock()
     storage = _make_storage(saved)
-    return Agent(client, user_id=1, storage=storage, strategy=strategy)
+    agent = Agent(client, user_id=1, storage=storage, strategy=strategy)
+    # Отключаем LLM-экстракцию памяти — не нужна в тестах агента
+    agent._memory.after_exchange = MagicMock()
+    return agent
 
 
 # ---------------------------------------------------------------------------

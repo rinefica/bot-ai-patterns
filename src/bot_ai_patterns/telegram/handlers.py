@@ -96,8 +96,12 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         "Привет! Доступные команды:\n"
         "/chat — диалог с агентом\n"
         "/strategy — переключить стратегию контекста\n"
-        "/reset — сбросить историю агента\n"
+        "/reset — сбросить историю (LTM сохраняется)\n"
         "/stop — завершить сессию\n\n"
+        "Память:\n"
+        "/memory — показать все слои памяти\n"
+        "/remember &lt;категория&gt; &lt;ключ&gt;: &lt;значение&gt; — добавить в LTM\n"
+        "/forget &lt;категория&gt; &lt;ключ&gt; — удалить из LTM\n\n"
         "Команды ветвления (стратегия branching):\n"
         "/checkpoint — зафиксировать точку ветвления\n"
         "/branch &lt;имя&gt; — создать ветку от checkpoint\n"
@@ -293,7 +297,83 @@ async def cmd_reset(message: Message) -> None:
     user_id = message.from_user.id
     if user_id in _agents:
         _agents[user_id].reset()
-    await message.answer("История агента сброшена.")
+    await message.answer(
+        "История диалога и рабочая память сброшены.\n"
+        "Долговременная память (LTM) сохранена — используй /memory для просмотра.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Команды управления памятью
+# ---------------------------------------------------------------------------
+
+_REMEMBER_HELP = (
+    "Использование: /remember &lt;категория&gt; &lt;ключ&gt;: &lt;значение&gt;\n\n"
+    "Категории:\n"
+    "  <code>profile</code>   — предпочтения, язык, уровень опыта\n"
+    "  <code>decisions</code> — принятые технические решения\n"
+    "  <code>knowledge</code> — факты о проекте/предметной области\n\n"
+    "Пример: /remember profile язык: Python"
+)
+
+
+@router.message(Command("memory"))
+async def cmd_memory(message: Message) -> None:
+    agent = _get_agent(message.from_user.id)
+    text = agent.memory.format_telegram()
+    await message.answer(text, parse_mode="HTML")
+
+
+@router.message(Command("remember"))
+async def cmd_remember(message: Message) -> None:
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 3 or ":" not in parts[2]:
+        await message.answer(_REMEMBER_HELP, parse_mode="HTML")
+        return
+
+    category = parts[1].strip().lower()
+    rest = parts[2]
+    key, _, value = rest.partition(":")
+    key, value = key.strip(), value.strip()
+
+    if not key or not value:
+        await message.answer(_REMEMBER_HELP, parse_mode="HTML")
+        return
+
+    agent = _get_agent(message.from_user.id)
+    try:
+        agent.memory.ltm.set(category, key, value)
+    except ValueError as exc:
+        await message.answer(str(exc), parse_mode="HTML")
+        return
+
+    await message.answer(
+        f"Записано в LTM [{category}]:\n<code>{key}</code>: {value}",
+        parse_mode="HTML",
+    )
+
+
+@router.message(Command("forget"))
+async def cmd_forget(message: Message) -> None:
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 3:
+        await message.answer(
+            "Использование: /forget &lt;категория&gt; &lt;ключ&gt;",
+            parse_mode="HTML",
+        )
+        return
+
+    category = parts[1].strip().lower()
+    key = parts[2].strip()
+    agent = _get_agent(message.from_user.id)
+
+    if agent.memory.ltm.remove(category, key):
+        await message.answer(f"Удалено из LTM [{category}]: <code>{key}</code>", parse_mode="HTML")
+    else:
+        await message.answer(
+            f"Ключ <code>{key}</code> не найден в категории [{category}].",
+            parse_mode="HTML",
+        )
 
 
 @router.message(Command("stop"))

@@ -56,11 +56,13 @@ class JSONStorage:
         strategy_name: str,
         strategy_state: dict,
         all_messages: list[dict[str, str]],
+        wm_state: dict | None = None,
     ) -> None:
         data = {
             "strategy_name": strategy_name,
             "strategy_state": strategy_state,
             "all_messages": all_messages,
+            "wm_state": wm_state,
         }
         self._path(user_id).write_text(
             json.dumps(data, ensure_ascii=False, indent=2),
