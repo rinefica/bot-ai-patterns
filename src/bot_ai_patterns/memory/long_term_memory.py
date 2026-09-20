@@ -10,6 +10,7 @@ from pathlib import Path
 import openai
 
 from bot_ai_patterns.config import MODEL_URI
+from bot_ai_patterns.utils import select_relevant
 
 MEMORY_DIR = Path("data/memory")
 CATEGORIES = ("profile", "decisions", "knowledge")
@@ -103,15 +104,22 @@ class LongTermMemory:
         except Exception:
             pass  # не ломаем диалог
 
-    def format_block(self) -> str | None:
+    def format_block(self, query: str | None = None) -> str | None:
         if self.is_empty():
             return None
         lines = ["[Долговременная память]"]
         for cat in CATEGORIES:
-            if self._data[cat]:
+            data = self._data[cat]
+            if not data:
+                continue
+            if query:
+                data = select_relevant(data, query)
+            if data:
                 lines.append(f"  {_CATEGORY_LABELS[cat]}:")
-                for k, v in self._data[cat].items():
+                for k, v in data.items():
                     lines.append(f"    • {k}: {v}")
+        if len(lines) == 1:
+            return None
         return "\n".join(lines)
 
     def format_telegram(self) -> str:

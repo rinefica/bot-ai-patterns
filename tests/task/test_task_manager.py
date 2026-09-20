@@ -4,7 +4,10 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from bot_ai_patterns.task.task_manager import TaskManager
+from bot_ai_patterns.task.task_state import StageTransitionError
 
 
 def _tm(user_id: int = 1, tmp_dir: Path | None = None) -> TaskManager:
@@ -21,14 +24,14 @@ class TestTaskManager:
         tm = _tm()
         task = tm.create("Разработка API")
         assert task.title == "Разработка API"
-        assert task.stage == "planning"
+        assert task.stage == "requirements"
         assert tm.has_task
 
     def test_advance_moves_stage(self):
         tm = _tm()
         tm.create("API")
         assert tm.advance() is True
-        assert tm.task.stage == "execution"
+        assert tm.task.stage == "implementation"
 
     def test_advance_without_task_returns_false(self):
         tm = _tm()
@@ -106,7 +109,7 @@ class TestTaskManager:
         tm2 = TaskManager(1, tmp)
         assert tm2.has_task
         assert tm2.task.title == "Маркетплейс"
-        assert tm2.task.stage == "execution"
+        assert tm2.task.stage == "implementation"
         assert tm2.task.current_step == "Разработка каталога"
 
     def test_different_users_isolated(self):
@@ -126,7 +129,7 @@ class TestTaskManager:
         tm = _tm()
         tm.create("API")
         text = tm.format_telegram()
-        assert "Планирование" in text
+        assert "Опрос требований" in text
         assert "API" in text
 
     def test_format_telegram_shows_pause(self):
@@ -135,3 +138,61 @@ class TestTaskManager:
         tm.pause()
         text = tm.format_telegram()
         assert "паузе" in text
+
+    # ------------------------------------------------------------------
+    # Явные переходы
+    # ------------------------------------------------------------------
+
+    def test_transition_to_valid_stage(self):
+        tm = _tm()
+        tm.create("Архитектура")
+        tm.transition_to("implementation")
+        assert tm.task.stage == "implementation"
+
+    def test_transition_to_invalid_raises(self):
+        tm = _tm()
+        tm.create("Архитектура")
+        with pytest.raises(StageTransitionError):
+            tm.transition_to("architecture")  # прыжок через implementation
+
+    def test_transition_to_skip_to_result_raises(self):
+        tm = _tm()
+        tm.create("API")
+        with pytest.raises(StageTransitionError):
+            tm.transition_to("result")
+
+    def test_transition_to_without_task_raises(self):
+        tm = _tm()
+        with pytest.raises(ValueError):
+            tm.transition_to("implementation")
+
+    def test_full_valid_pipeline(self):
+        tm = _tm()
+        tm.create("API")
+        tm.transition_to("implementation")
+        tm.transition_to("architecture")
+        tm.transition_to("result")
+        assert tm.task.is_done
+
+    def test_advance_blocked_at_result(self):
+        tm = _tm()
+        tm.create("API")
+        while not tm.task.is_done:
+            tm.advance()
+        assert tm.advance() is False
+
+    def test_pause_and_resume_preserves_stage(self):
+        tm = _tm()
+        tm.create("API")
+        tm.transition_to("implementation")
+        tm.pause()
+        # После паузы этап сохранён
+        assert tm.task.stage == "implementation"
+        assert tm.task.paused is True
+        tm.resume()
+        # После resume нельзя прыгнуть — только следующий этап
+        with pytest.raises(StageTransitionError):
+            tm.transition_to("result")
+        # Правильный переход работает
+        tm.transition_to("architecture")
+        assert tm.task.stage == "architecture"

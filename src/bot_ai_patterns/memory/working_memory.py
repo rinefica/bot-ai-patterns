@@ -7,6 +7,7 @@ from __future__ import annotations
 import openai
 
 from bot_ai_patterns.config import MODEL_URI
+from bot_ai_patterns.utils import select_relevant
 
 _EXTRACT_SYSTEM = (
     "Ты извлекаешь данные о текущей задаче из диалога.\n"
@@ -78,10 +79,13 @@ class WorkingMemory:
         except Exception:
             pass  # не ломаем диалог
 
-    def format_block(self) -> str | None:
+    def format_block(self, query: str | None = None) -> str | None:
         if not self._data:
             return None
-        lines = "\n".join(f"• {k}: {v}" for k, v in self._data.items())
+        data = select_relevant(self._data, query) if query else self._data
+        if not data:
+            return None
+        lines = "\n".join(f"• {k}: {v}" for k, v in data.items())
         return f"[Рабочая память — текущая задача]\n{lines}"
 
     # ------------------------------------------------------------------

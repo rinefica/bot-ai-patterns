@@ -40,9 +40,14 @@ class MemoryManager:
         self.invariants = InvariantsStore(user_id)
 
     def build_messages(
-        self, strategy: ContextStrategy, system_prompt: str
+        self, strategy: ContextStrategy, system_prompt: str, query: str | None = None
     ) -> list[dict[str, str]]:
-        """Собрать финальный список сообщений с инжекцией памяти."""
+        """Собрать финальный список сообщений с инжекцией памяти.
+
+        query — текущий запрос пользователя; если передан, LTM и WM фильтруются
+        по релевантности (только записи, связанные с запросом).
+        Инварианты, профиль и FSM задачи всегда инжектируются целиком.
+        """
         base = strategy.build_messages(system_prompt)
 
         # base[0] — system prompt; вставляем LTM и WM сразу после него
@@ -51,28 +56,28 @@ class MemoryManager:
 
         result = [base[0]]
 
-        # 0. Инварианты — наивысший приоритет: нельзя нарушать
+        # 0. Инварианты — наивысший приоритет: нельзя нарушать (всегда все)
         inv_block = self.invariants.format_context_block()
         if inv_block:
             result.append({"role": "system", "content": inv_block})
 
-        # 1. Профиль — явные инструкции по стилю для каждого ответа
+        # 1. Профиль — инструкции по стилю (всегда все, применяются к каждому ответу)
         profile_block = self.profile.format_system_block()
         if profile_block:
             result.append({"role": "system", "content": profile_block})
 
-        # 2. Состояние задачи (FSM) — этап, шаг, ожидаемое действие
+        # 2. Состояние задачи (FSM) — этап, шаг, ожидаемое действие (всегда)
         task_block = self.task.format_context_block()
         if task_block:
             result.append({"role": "system", "content": task_block})
 
-        # 3. LTM — решения и знания из прошлых сессий
-        ltm_block = self.ltm.format_block()
+        # 3. LTM — только релевантные записи (decisions, knowledge)
+        ltm_block = self.ltm.format_block(query=query)
         if ltm_block:
             result.append({"role": "system", "content": ltm_block})
 
-        # 4. WM — данные текущей задачи (авто-экстракция)
-        wm_block = self.wm.format_block()
+        # 4. WM — только релевантные данные текущей задачи
+        wm_block = self.wm.format_block(query=query)
         if wm_block:
             result.append({"role": "system", "content": wm_block})
 

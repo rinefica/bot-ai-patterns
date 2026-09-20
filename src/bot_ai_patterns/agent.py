@@ -119,7 +119,7 @@ class Agent:
         self._strategy.add_user(user_input)
         self._all_messages.append({"role": "user", "content": user_input})
 
-        messages = self._memory.build_messages(self._strategy, self._system_prompt)
+        messages = self._memory.build_messages(self._strategy, self._system_prompt, query=user_input)
 
         try:
             response = self._client.chat.completions.create(
@@ -155,11 +155,18 @@ class Agent:
             all_messages=self._all_messages,
             wm_state=self._memory.get_wm_state(),
         )
-        self._memory.after_exchange(user_input, reply)
         self._stats.add(token_usage)
         self._last_usage = token_usage
 
         return reply, token_usage
+
+    def update_memory(self, user_input: str, reply: str) -> None:
+        """Обновить WM и LTM на основе последнего обмена.
+
+        Вызывается асинхронно после отправки ответа пользователю —
+        не блокирует основной диалог.
+        """
+        self._memory.after_exchange(user_input, reply)
 
     def switch_strategy(self, strategy: ContextStrategy) -> None:
         """Переключить стратегию, инициализируя её из аудит-лога."""

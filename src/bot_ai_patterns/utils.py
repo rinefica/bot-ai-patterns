@@ -49,6 +49,48 @@ class _TelegramHTMLConverter(HTMLParser):
         return "".join(self._parts).strip()
 
 
+_TG_MAX = 4096
+
+
+def select_relevant(entries: dict[str, str], query: str, top_n: int = 6) -> dict[str, str]:
+    """Выбрать наиболее релевантные записи по пересечению токенов с запросом.
+
+    Если совпадений нет — возвращает первые top_n записей (не отбрасывать всё).
+    """
+    query_tokens = set(query.lower().split())
+    scored = [
+        (len(query_tokens & set((k + " " + v).lower().split())), k, v)
+        for k, v in entries.items()
+    ]
+    scored.sort(key=lambda x: x[0], reverse=True)
+    with_match = [(k, v) for score, k, v in scored if score > 0]
+    result = with_match if with_match else [(k, v) for _, k, v in scored]
+    return dict(result[:top_n])
+
+
+def split_message(text: str, limit: int = _TG_MAX) -> list[str]:
+    """Разбить текст на части не длиннее limit символов, по переносам строк."""
+    if len(text) <= limit:
+        return [text]
+    parts: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    for line in text.splitlines(keepends=True):
+        if current_len + len(line) > limit and current:
+            parts.append("".join(current))
+            current = []
+            current_len = 0
+        # если одна строка длиннее лимита — режем жёстко
+        while len(line) > limit:
+            parts.append(line[:limit])
+            line = line[limit:]
+        current.append(line)
+        current_len += len(line)
+    if current:
+        parts.append("".join(current))
+    return parts
+
+
 def html_to_telegram(html: str) -> str:
     converter = _TelegramHTMLConverter()
     converter.feed(html)

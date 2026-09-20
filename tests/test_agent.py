@@ -14,7 +14,6 @@ from bot_ai_patterns.agent import (
 )
 from bot_ai_patterns.config import CONTEXT_LIMIT, CONTEXT_WARN_THRESHOLD
 from bot_ai_patterns.context_strategies import (
-    BranchingStrategy,
     SlidingWindowStrategy,
     StickyFactsStrategy,
 )
@@ -260,7 +259,7 @@ class TestSwitchStrategy:
         agent = _make_agent(client, strategy=SlidingWindowStrategy())
 
         agent.chat("вопрос")
-        new_strategy = BranchingStrategy()
+        new_strategy = StickyFactsStrategy(MagicMock())
         agent.switch_strategy(new_strategy)
 
         assert agent.strategy is new_strategy
@@ -272,8 +271,8 @@ class TestSwitchStrategy:
         agent = _make_agent(client, strategy=SlidingWindowStrategy())
         agent.chat("вопрос")
 
-        mock_strategy = MagicMock(spec=BranchingStrategy)
-        mock_strategy.name = "branching"
+        mock_strategy = MagicMock(spec=SlidingWindowStrategy)
+        mock_strategy.name = "sliding_window"
         agent.switch_strategy(mock_strategy)
 
         mock_strategy.init_from_messages.assert_called_once()

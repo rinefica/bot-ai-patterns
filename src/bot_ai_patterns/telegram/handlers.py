@@ -10,14 +10,13 @@ from bot_ai_patterns.agent import Agent, ContextOverflowError
 from bot_ai_patterns.client import get_client
 from bot_ai_patterns.config import CONTEXT_LIMIT, CONTEXT_WARN_THRESHOLD
 from bot_ai_patterns.context_strategies import (
-    BranchingStrategy,
     SlidingWindowStrategy,
     StickyFactsStrategy,
 )
-from bot_ai_patterns.prompts import DEV_PLAN_SYSTEM
+from bot_ai_patterns.prompts import ARCH_SYSTEM
 from bot_ai_patterns.storage import JSONStorage
 from bot_ai_patterns.strategies import run as run_strategy
-from bot_ai_patterns.utils import html_to_telegram, sanitize
+from bot_ai_patterns.utils import html_to_telegram, sanitize, split_message
 
 router = Router()
 _client = get_client()
@@ -27,9 +26,8 @@ _agents: dict[int, Agent] = {}
 
 _STRATEGY_HELP = (
     "Доступные стратегии:\n"
-    "  <code>sliding</code>  — скользящее окно N последних сообщений\n"
-    "  <code>facts</code>    — ключевые факты + последние N сообщений\n"
-    "  <code>branching</code>— независимые ветки от checkpoint\n\n"
+    "  <code>sliding</code> — скользящее окно N последних сообщений\n"
+    "  <code>facts</code>   — ключевые факты + последние N сообщений\n\n"
     "Использование: /strategy &lt;название&gt;"
 )
 
@@ -45,7 +43,7 @@ def _get_agent(user_id: int) -> Agent:
             _client,
             user_id=user_id,
             storage=_storage,
-            system_prompt=DEV_PLAN_SYSTEM,
+            system_prompt=ARCH_SYSTEM,
         )
     return _agents[user_id]
 
@@ -112,11 +110,6 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         "/memory — показать все слои памяти\n"
         "/remember &lt;категория&gt; &lt;ключ&gt;: &lt;значение&gt; — добавить в LTM\n"
         "/forget &lt;категория&gt; &lt;ключ&gt; — удалить из LTM\n\n"
-        "Команды ветвления (стратегия branching):\n"
-        "/checkpoint — зафиксировать точку ветвления\n"
-        "/branch &lt;имя&gt; — создать ветку от checkpoint\n"
-        "/switch &lt;имя&gt; — переключиться на ветку\n"
-        "/branches — список веток\n\n"
         "Или просто отправь задачу — получишь ответ.",
         parse_mode="HTML",
     )
@@ -128,10 +121,26 @@ async def cmd_chat(message: Message, state: FSMContext) -> None:
     await state.set_state(Form.chatting)
     agent = _get_agent(message.from_user.id)
     stats = agent.stats
+    tm = agent.memory.task
+
+    # Автоматически создать задачу архитектуры если нет активной
+    if not tm.has_task:
+        tm.create("Проектирование архитектуры")
+
+    task = tm.task
     turns_info = f" (продолжаем, {stats.turns} реплик)" if stats.turns > 0 else ""
+
+    from bot_ai_patterns.task.task_state import STAGE_LABELS
+    stage_label = STAGE_LABELS.get(task.stage, task.stage)
+
     await message.answer(
-        f"Режим диалога активирован{turns_info}.\n"
-        f"Текущая стратегия: <b>{agent.strategy.display_name}</b>\n"
+        f"Режим архитектурного консультанта активирован{turns_info}.\n\n"
+        f"<b>Задача:</b> {task.title}\n"
+        f"<b>Текущий этап:</b> {stage_label}\n\n"
+        "Управление этапами:\n"
+        "  /task advance — следующий этап\n"
+        "  /task — текущее состояние\n\n"
+        f"Стратегия контекста: <b>{agent.strategy.display_name}</b>\n"
         "/strategy — сменить, /reset — сбросить, /stop — выйти.",
         parse_mode="HTML",
     )
@@ -159,8 +168,6 @@ async def cmd_strategy(message: Message) -> None:
         new_strategy = SlidingWindowStrategy()
     elif slug in ("facts", "sticky", "sticky_facts"):
         new_strategy = StickyFactsStrategy(_client)
-    elif slug in ("branching", "branch", "branches"):
-        new_strategy = BranchingStrategy()
     else:
         await message.answer(
             f"Неизвестная стратегия: <code>{slug}</code>\n\n{_STRATEGY_HELP}",
@@ -172,128 +179,6 @@ async def cmd_strategy(message: Message) -> None:
     await message.answer(
         f"Стратегия переключена: <b>{new_strategy.display_name}</b>\n"
         "Продолжай диалог — стратегия инициализирована из истории.",
-        parse_mode="HTML",
-    )
-
-
-# ---------------------------------------------------------------------------
-# Команды ветвления (только для BranchingStrategy)
-# ---------------------------------------------------------------------------
-
-def _require_branching(agent: Agent) -> BranchingStrategy | None:
-    if isinstance(agent.strategy, BranchingStrategy):
-        return agent.strategy
-    return None
-
-
-@router.message(Command("checkpoint"))
-async def cmd_checkpoint(message: Message) -> None:
-    agent = _get_agent(message.from_user.id)
-    bs = _require_branching(agent)
-    if bs is None:
-        await message.answer(
-            "Команда /checkpoint доступна только в стратегии <b>branching</b>.\n"
-            "Переключи: /strategy branching",
-            parse_mode="HTML",
-        )
-        return
-
-    bs.set_checkpoint()
-    await message.answer(
-        f"Checkpoint установлен: {len(bs._checkpoint)} сообщений в ветке [{bs.current_branch_name}].\n"
-        "Теперь создай ветку командой /branch &lt;имя&gt;.",
-        parse_mode="HTML",
-    )
-
-
-@router.message(Command("branch"))
-async def cmd_branch(message: Message) -> None:
-    agent = _get_agent(message.from_user.id)
-    bs = _require_branching(agent)
-    if bs is None:
-        await message.answer(
-            "Команда /branch доступна только в стратегии <b>branching</b>.",
-            parse_mode="HTML",
-        )
-        return
-
-    parts = (message.text or "").split(maxsplit=1)
-    if len(parts) < 2 or not parts[1].strip():
-        await message.answer("Укажи имя ветки: /branch &lt;имя&gt;", parse_mode="HTML")
-        return
-
-    name = parts[1].strip()
-    if not bs.checkpoint_set:
-        await message.answer("Сначала установи checkpoint командой /checkpoint.")
-        return
-
-    if not bs.create_branch(name):
-        await message.answer(f"Ветка <b>{name}</b> уже существует.", parse_mode="HTML")
-        return
-
-    await message.answer(
-        f"Ветка <b>{name}</b> создана от checkpoint.\n"
-        f"Переключись на неё: /switch {name}",
-        parse_mode="HTML",
-    )
-
-
-@router.message(Command("switch"))
-async def cmd_switch(message: Message) -> None:
-    agent = _get_agent(message.from_user.id)
-    bs = _require_branching(agent)
-    if bs is None:
-        await message.answer(
-            "Команда /switch доступна только в стратегии <b>branching</b>.",
-            parse_mode="HTML",
-        )
-        return
-
-    parts = (message.text or "").split(maxsplit=1)
-    if len(parts) < 2 or not parts[1].strip():
-        await message.answer("Укажи имя ветки: /switch &lt;имя&gt;", parse_mode="HTML")
-        return
-
-    name = parts[1].strip()
-    if not bs.switch_branch(name):
-        branches = ", ".join(bs.branch_names)
-        await message.answer(
-            f"Ветка <b>{name}</b> не найдена.\nДоступные: {branches}",
-            parse_mode="HTML",
-        )
-        return
-
-    await message.answer(
-        f"Переключился на ветку <b>{name}</b>.\n"
-        f"Сообщений в ветке: {bs.message_count}",
-        parse_mode="HTML",
-    )
-
-
-@router.message(Command("branches"))
-async def cmd_branches(message: Message) -> None:
-    agent = _get_agent(message.from_user.id)
-    bs = _require_branching(agent)
-    if bs is None:
-        await message.answer(
-            "Команда /branches доступна только в стратегии <b>branching</b>.",
-            parse_mode="HTML",
-        )
-        return
-
-    lines = []
-    for name in bs.branch_names:
-        branch = bs._branches[name]
-        marker = " ◄ текущая" if name == bs.current_branch_name else ""
-        lines.append(f"  <b>{name}</b>: {len(branch.messages)} сообщ.{marker}")
-
-    checkpoint_info = (
-        f"\nCheckpoint: {len(bs._checkpoint)} сообщ."
-        if bs.checkpoint_set else "\nCheckpoint: не установлен"
-    )
-
-    await message.answer(
-        f"<b>Ветки диалога:</b>\n" + "\n".join(lines) + checkpoint_info,
         parse_mode="HTML",
     )
 
@@ -339,7 +224,8 @@ async def cmd_profile(message: Message) -> None:
 
     # /profile — просмотр
     if len(parts) == 1:
-        await message.answer(profile.format_telegram(), parse_mode="HTML")
+        for part in split_message(profile.format_telegram()):
+            await message.answer(part, parse_mode="HTML")
         return
 
     sub = parts[1].strip().lower()
@@ -417,7 +303,8 @@ _REMEMBER_HELP = (
 async def cmd_memory(message: Message) -> None:
     agent = _get_agent(message.from_user.id)
     text = agent.memory.format_telegram()
-    await message.answer(text, parse_mode="HTML")
+    for part in split_message(text):
+        await message.answer(part, parse_mode="HTML")
 
 
 @router.message(Command("remember"))
@@ -559,20 +446,27 @@ async def cmd_invariant(message: Message) -> None:
 # Команды управления задачей (FSM)
 # ---------------------------------------------------------------------------
 
-from bot_ai_patterns.task.task_state import STAGE_ORDER, STAGE_LABELS  # noqa: E402
+from bot_ai_patterns.task.task_state import (  # noqa: E402
+    ALLOWED_TRANSITIONS,
+    STAGE_LABELS,
+    STAGE_ORDER,
+    StageTransitionError,
+)
 
 _TASK_HELP = (
     "<b>Управление задачей:</b>\n\n"
     "  /task — показать состояние\n"
     "  /task new &lt;название&gt; — создать задачу\n"
-    "  /task advance — следующий этап\n"
+    "  /task advance — следующий этап (только допустимый)\n"
+    "  /task go &lt;этап&gt; — явный переход с проверкой\n"
     "  /task step &lt;описание&gt; — установить текущий шаг\n"
     "  /task action &lt;описание&gt; — установить ожидаемое действие\n"
     "  /task note &lt;заметка&gt; — добавить заметку\n"
     "  /task pause — поставить на паузу\n"
     "  /task resume — возобновить (агент продолжит без повторений)\n"
     "  /task clear — удалить задачу\n\n"
-    f"Этапы: {' → '.join(STAGE_LABELS[s] for s in STAGE_ORDER)}"
+    f"Этапы: {' → '.join(STAGE_LABELS[s] for s in STAGE_ORDER)}\n"
+    "Переходы строго последовательны — прыжки запрещены."
 )
 
 
@@ -605,7 +499,7 @@ async def cmd_task(message: Message) -> None:
         )
         return
 
-    # /task advance
+    # /task advance — переход на единственный допустимый следующий этап
     if sub == "advance":
         if not tm.has_task:
             await message.answer("Нет активной задачи. Создай командой /task new.")
@@ -618,7 +512,44 @@ async def cmd_task(message: Message) -> None:
                 parse_mode="HTML",
             )
         else:
-            await message.answer("Задача уже завершена (done).")
+            await message.answer(
+                f"Этап <b>{old_stage}</b> является финальным — переходов нет.",
+                parse_mode="HTML",
+            )
+        return
+
+    # /task go <этап> — явный переход с проверкой допустимости
+    if sub == "go":
+        if not tm.has_task:
+            await message.answer("Нет активной задачи.")
+            return
+        if not arg:
+            allowed = tm.task.allowed_next
+            if allowed:
+                allowed_str = ", ".join(f"<code>{s}</code>" for s in allowed)
+                await message.answer(
+                    f"Укажи этап: /task go &lt;этап&gt;\n"
+                    f"Допустимые переходы: {allowed_str}",
+                    parse_mode="HTML",
+                )
+            else:
+                await message.answer("Финальный этап — переходов нет.")
+            return
+        try:
+            old_label = tm.task.stage_label
+            tm.transition_to(arg)
+            await message.answer(
+                f"Переход: <b>{old_label}</b> → <b>{tm.task.stage_label}</b>\n\n"
+                + tm.format_telegram(),
+                parse_mode="HTML",
+            )
+        except StageTransitionError as exc:
+            await message.answer(
+                f"<b>Недопустимый переход</b>\n\n{exc}",
+                parse_mode="HTML",
+            )
+        except ValueError as exc:
+            await message.answer(str(exc))
         return
 
     # /task step <описание>
@@ -723,7 +654,10 @@ async def handle_chat(message: Message) -> None:
 
     token_info = _format_token_stats(agent)
     await status.delete()
-    await message.answer(reply + token_info, parse_mode="HTML")
+    for part in split_message(reply + token_info):
+        await message.answer(part, parse_mode="HTML")
+
+    asyncio.create_task(asyncio.to_thread(agent.update_memory, user_input, reply))
 
 
 @router.message(Form.waiting_for_query)

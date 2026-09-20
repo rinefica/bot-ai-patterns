@@ -4,7 +4,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from bot_ai_patterns.task.task_state import STAGE_DEFAULT_ACTIONS, TaskState
+from bot_ai_patterns.task.task_state import (
+    STAGE_DEFAULT_ACTIONS,
+    STAGE_LABELS,
+    StageTransitionError,
+    TaskState,
+)
 
 TASKS_DIR = Path("data/tasks")
 
@@ -48,20 +53,35 @@ class TaskManager:
         """Создать новую задачу (заменяет предыдущую)."""
         self._task = TaskState(
             title=title,
-            expected_action=STAGE_DEFAULT_ACTIONS["planning"],
+            expected_action=STAGE_DEFAULT_ACTIONS["requirements"],
         )
         self._resuming = False
         self._save()
         return self._task
 
     def advance(self) -> bool:
-        """Перейти на следующий этап."""
+        """Перейти на единственный допустимый следующий этап.
+
+        Возвращает False если задачи нет или финальный этап.
+        """
         if self._task is None:
             return False
         result = self._task.advance()
         if result:
             self._save()
         return result
+
+    def transition_to(self, stage: str) -> None:
+        """Явный переход в указанный этап.
+
+        Raises:
+            ValueError: если нет активной задачи.
+            StageTransitionError: если переход запрещён.
+        """
+        if self._task is None:
+            raise ValueError("Нет активной задачи.")
+        self._task.transition_to(stage)  # raises StageTransitionError if invalid
+        self._save()
 
     def pause(self) -> bool:
         if self._task is None:

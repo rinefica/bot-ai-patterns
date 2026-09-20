@@ -38,14 +38,20 @@ class JSONStorage:
             return {}
         raw = json.loads(path.read_text(encoding="utf-8"))
 
-        # Backward compat: v1 — просто список сообщений
-        if isinstance(raw, list):
-            return {"strategy_name": None, "strategy_state": None, "all_messages": raw}
+        migrated: dict | None = None
 
-        # Backward compat: v2 — dict с history/summary/recent (day9)
-        if "history" in raw and "strategy_name" not in raw:
+        # v1 — просто список сообщений
+        if isinstance(raw, list):
+            migrated = {"strategy_name": None, "strategy_state": None, "all_messages": raw}
+
+        # v2 — dict с history/summary/recent (day9)
+        elif "history" in raw and "strategy_name" not in raw:
             all_msgs = [m for m in raw.get("history", []) if m.get("role") != "system"]
-            return {"strategy_name": None, "strategy_state": None, "all_messages": all_msgs}
+            migrated = {"strategy_name": None, "strategy_state": None, "all_messages": all_msgs}
+
+        if migrated is not None:
+            path.write_text(json.dumps(migrated, ensure_ascii=False, indent=2), encoding="utf-8")
+            return migrated
 
         return raw
 
