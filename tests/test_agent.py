@@ -87,9 +87,10 @@ class TestSessionStats:
         assert s.total_tokens == 410
 
     def test_cost_rub(self):
+        from bot_ai_patterns.config import MAIN_MODEL_PRICE_PER_1K
         s = SessionStats()
         s.add(TokenUsage(500, 500, 1000))
-        assert s.cost_rub == pytest.approx(6.0)
+        assert s.cost_rub == pytest.approx(1000 * MAIN_MODEL_PRICE_PER_1K / 1000)
 
     def test_context_fill_pct(self):
         s = SessionStats()

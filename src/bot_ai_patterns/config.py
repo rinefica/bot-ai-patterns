@@ -1,35 +1,19 @@
-YANDEX_CLOUD_FOLDER = "b1gesnd8o5f6co3dkvij"
-YANDEX_CLOUD_MODEL = "yandexgpt-5-pro/latest"
-YANDEX_BASE_URL = "https://llm.api.cloud.yandex.net/v1"
-MODEL_URI = f"gpt://{YANDEX_CLOUD_FOLDER}/{YANDEX_CLOUD_MODEL}"
+DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
+MODEL_URI = "deepseek-chat"
 MAX_TOKENS = 1024
 MAX_RETRIES = 3
 
-# Лимит контекста YandexGPT-5-Pro (токены)
-# При превышении API вернёт ошибку или усечёт историю
-CONTEXT_LIMIT = 8192
+# Лимит контекста DeepSeek-V3 (токены)
+CONTEXT_LIMIT = 64000
 
 # Порог предупреждения — 80% от лимита
 CONTEXT_WARN_THRESHOLD = int(CONTEXT_LIMIT * 0.8)
 
-# Цена основной модели (руб. за 1000 токенов)
-MAIN_MODEL_PRICE_PER_1K = 6.00
+# Цена основной модели ($ за 1000 токенов, output)
+MAIN_MODEL_PRICE_PER_1K = 0.28
 
 # Стратегии управления контекстом
 # Sliding Window: число сообщений в скользящем окне
 WINDOW_SIZE = 6
 # Sticky Facts: размер окна последних сообщений + блок фактов
 FACTS_WINDOW_SIZE = 6
-
-
-def _uri(model: str) -> str:
-    return f"gpt://{YANDEX_CLOUD_FOLDER}/{model}"
-
-
-# Модели для сравнения: слабая → средняя → сильная
-# Цены: https://yandex.cloud/ru/prices#foundation-models (руб. за 1000 токенов)
-COMPARE_MODELS = [
-    {"label": "🟢 Lite",     "uri": _uri("yandexgpt-lite/latest"), "price_per_1k": 0.20},
-    {"label": "🟡 GPT-4 Pro", "uri": _uri("yandexgpt/latest"),     "price_per_1k": 1.20},
-    {"label": "🔴 GPT-5 Pro", "uri": _uri("yandexgpt-5-pro/latest"), "price_per_1k": 6.00},
-]
