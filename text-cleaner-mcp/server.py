@@ -40,11 +40,68 @@ class SummaryResult(BaseModel):
     summary: str
 
 
+class PatternDetectResult(BaseModel):
+    is_pattern: bool
+    confidence: float
+    reason: str
+
+
 def _get_client() -> openai.OpenAI:
     api_key = os.environ.get("DEEPSEEK_API_KEY")
     if not api_key:
         raise RuntimeError("DEEPSEEK_API_KEY not set")
     return openai.OpenAI(api_key=api_key, base_url=_DEEPSEEK_BASE_URL)
+
+
+_DETECT_PROMPT = """\
+Ты — эксперт по швейному делу. Определи, является ли переданный текст описанием \
+швейного изделия, выкройки или инструкцией по пошиву.
+
+Верни строго JSON без markdown-обёртки:
+{"is_pattern": true/false, "confidence": 0.0-1.0, "reason": "краткое пояснение"}
+"""
+
+
+@mcp.tool(
+    name="is_sewing_pattern",
+    description=(
+        "Classify whether the given text is from a sewing pattern or garment description. "
+        "Returns is_pattern (bool), confidence (0-1), and a short reason."
+    ),
+)
+def is_sewing_pattern(
+    text: Annotated[str, Field(description="Text extracted from a PDF to classify.")],
+) -> PatternDetectResult:
+    if not text.strip():
+        return PatternDetectResult(is_pattern=False, confidence=1.0, reason="Пустой текст")
+
+    client = _get_client()
+    response = client.chat.completions.create(
+        model=_MODEL,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": _DETECT_PROMPT},
+            {"role": "user", "content": f"Текст:\n\n{text[:3000]}"},
+        ],
+        max_tokens=256,
+        temperature=0.1,
+    )
+    raw = response.choices[0].message.content.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```", 2)[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+        raw = raw.rsplit("```", 1)[0].strip()
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"DeepSeek returned invalid JSON: {exc}") from exc
+
+    return PatternDetectResult(
+        is_pattern=bool(data.get("is_pattern", False)),
+        confidence=float(data.get("confidence", 0.5)),
+        reason=data.get("reason", ""),
+    )
 
 
 @mcp.tool(

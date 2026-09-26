@@ -24,6 +24,13 @@ class PdfPageImageResult(BaseModel):
     height_px: int
 
 
+class ScanResult(BaseModel):
+    pdf_path: str
+    total_pages: int
+    pages_scanned: int
+    text: str
+
+
 @mcp.tool(
     name="pdf_read_text",
     description="Extract text content from a PDF file — either a single page or all pages.",
@@ -58,6 +65,50 @@ def pdf_read_text(
         total_pages=total,
         page=page,
         text=text.strip(),
+    )
+
+
+@mcp.tool(
+    name="scan_for_description",
+    description=(
+        "Scan PDF pages one by one, accumulating text until min_words is reached "
+        "or max_pages is exhausted. Returns all accumulated text and scan metadata."
+    ),
+)
+def scan_for_description(
+    pdf_path: Annotated[str, Field(description="Absolute path to the PDF file.")],
+    max_pages: Annotated[
+        int, Field(description="Maximum number of pages to scan.", ge=1, le=50)
+    ] = 20,
+    min_words: Annotated[
+        int,
+        Field(description="Stop scanning early once this many words are accumulated.", ge=50),
+    ] = 300,
+) -> ScanResult:
+    path = Path(pdf_path)
+    if not path.exists():
+        raise FileNotFoundError(f"File not found: {pdf_path}")
+
+    reader = PdfReader(str(path))
+    total = len(reader.pages)
+    limit = min(max_pages, total)
+
+    parts: list[str] = []
+    word_count = 0
+
+    for i in range(limit):
+        page_text = (reader.pages[i].extract_text() or "").strip()
+        if page_text:
+            parts.append(f"--- Страница {i + 1} ---\n{page_text}")
+            word_count += len(page_text.split())
+        if word_count >= min_words:
+            break
+
+    return ScanResult(
+        pdf_path=str(path),
+        total_pages=total,
+        pages_scanned=len(parts),
+        text="\n\n".join(parts).strip(),
     )
 
 

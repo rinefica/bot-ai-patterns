@@ -1,4 +1,5 @@
 import asyncio
+import os
 
 from aiogram import F, Router
 from aiogram.filters import Command
@@ -8,9 +9,7 @@ from aiogram.types import BufferedInputFile, Message
 
 from bot_ai_patterns.agent import Agent, ContextOverflowError
 from bot_ai_patterns.client import get_client
-from bot_ai_patterns.pdf_client import process_pdf
-from bot_ai_patterns.tagger_client import extract_tags
-from bot_ai_patterns.text_cleaner_client import clean_and_summarize
+from bot_ai_patterns.mcp_orchestrator import process_collection
 from bot_ai_patterns.config import CONTEXT_LIMIT, CONTEXT_WARN_THRESHOLD
 from bot_ai_patterns.context_strategies import (
     SlidingWindowStrategy,
@@ -38,7 +37,10 @@ _STRATEGY_HELP = (
 class Form(StatesGroup):
     waiting_for_query = State()
     chatting = State()
-    waiting_for_pdf = State()
+    collecting_pdfs = State()
+
+# user_id → list of (pdf_bytes, file_name, telegram_file_url)
+_pdf_collections: dict[int, list[tuple[bytes, str, str]]] = {}
 
 
 def _get_agent(user_id: int) -> Agent:
@@ -114,8 +116,8 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         "/memory — показать все слои памяти\n"
         "/remember &lt;категория&gt; &lt;ключ&gt;: &lt;значение&gt; — добавить в LTM\n"
         "/forget &lt;категория&gt; &lt;ключ&gt; — удалить из LTM\n\n"
-        "PDF-пайплайн:\n"
-        "/pdf — запуск цепочки: превью + текст → саммари → теги изделия\n\n"
+        "PDF-пайплайн (multi-MCP):\n"
+        "/pdf — загрузи несколько PDF-выкроек, отправь /done — получишь Telegraph-страницу\n\n"
         "Или просто отправь задачу — получишь ответ.",
         parse_mode="HTML",
     )
@@ -628,107 +630,96 @@ async def cmd_task(message: Message) -> None:
 
 
 # ---------------------------------------------------------------------------
-# PDF — обработка документов через first-mcp MCP-сервер
+# PDF — multi-file пайплайн через 4 MCP-сервера → Telegraph
 # ---------------------------------------------------------------------------
 
 @router.message(Command("pdf"))
 async def cmd_pdf(message: Message, state: FSMContext) -> None:
-    await state.set_state(Form.waiting_for_pdf)
+    _pdf_collections[message.from_user.id] = []
+    await state.set_state(Form.collecting_pdfs)
     await message.answer(
-        "Отправь PDF-файл с описанием швейного изделия.\n\n"
-        "Пайплайн:\n"
-        "1️⃣ Извлечение текста и превью (first-mcp)\n"
-        "2️⃣ Очистка и саммари (text-cleaner-mcp → DeepSeek)\n"
-        "3️⃣ Теги изделия (tagger-mcp → DeepSeek)\n\n"
+        "Отправляй PDF-файлы с выкройками (можно несколько).\n"
+        "Когда загрузишь все — отправь /done.\n\n"
+        "Пайплайн (multi-MCP):\n"
+        "1️⃣ first-mcp — сканирование страниц до описания\n"
+        "2️⃣ text-cleaner-mcp — определение выкройки + саммари\n"
+        "3️⃣ tagger-mcp — теги изделия\n"
+        "4️⃣ telegraph-mcp — обложка + страница с результатами\n\n"
         "/stop — отменить."
     )
 
 
-@router.message(Form.waiting_for_pdf, F.document)
-async def handle_pdf_document(message: Message, state: FSMContext) -> None:
+@router.message(Form.collecting_pdfs, F.document)
+async def handle_pdf_collect(message: Message, state: FSMContext) -> None:
     doc = message.document
     if not (doc.file_name or "").lower().endswith(".pdf"):
-        await message.answer("Нужен PDF-файл. Попробуй ещё раз или /stop для отмены.")
+        await message.answer("Нужен PDF. Пропускаю этот файл.")
         return
-
-    # ── Шаг 1: извлечение текста и картинки ─────────────────────────────────
-    step1 = await message.answer("⏳ <b>Шаг 1/3</b> — извлекаю текст и превью страницы...", parse_mode="HTML")
-    try:
-        file_data = await message.bot.download(doc)
-        pdf_bytes = file_data.read()
-        png_bytes, raw_text = await process_pdf(pdf_bytes)
-    except Exception as exc:
-        await step1.edit_text(f"❌ <b>Шаг 1 — ошибка:</b> {exc}", parse_mode="HTML")
-        return
-
-    await step1.edit_text("✅ <b>Шаг 1/3</b> — текст и превью извлечены.", parse_mode="HTML")
-
-    if png_bytes:
-        await message.answer_photo(
-            BufferedInputFile(png_bytes, filename="page1.png"),
-            caption="Первая страница PDF",
-        )
-    if raw_text:
-        for part in split_message(f"<b>Сырой текст (до 5 страниц):</b>\n\n{raw_text}"):
-            await message.answer(part, parse_mode="HTML")
-    else:
-        await message.answer("Текст в документе не найден — пайплайн остановлен.")
-        await state.set_state(Form.waiting_for_query)
-        return
-
-    # ── Шаг 2: очистка и саммари через DeepSeek ──────────────────────────────
-    step2 = await message.answer("⏳ <b>Шаг 2/3</b> — очищаю текст и генерирую описание...", parse_mode="HTML")
-    try:
-        cleaner_result = await clean_and_summarize(raw_text)
-    except Exception as exc:
-        await step2.edit_text(f"❌ <b>Шаг 2 — ошибка:</b> {exc}", parse_mode="HTML")
-        await state.set_state(Form.waiting_for_query)
-        return
-
-    summary = cleaner_result.get("summary", "")
-    item_type = cleaner_result.get("item_type", "неизвестно")
-    await step2.edit_text("✅ <b>Шаг 2/3</b> — описание готово.", parse_mode="HTML")
+    file_data = await message.bot.download(doc)
+    pdf_bytes = file_data.read()
+    tg_file = await message.bot.get_file(doc.file_id)
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    file_url = f"https://api.telegram.org/file/bot{bot_token}/{tg_file.file_path}"
+    user_id = message.from_user.id
+    _pdf_collections.setdefault(user_id, []).append((pdf_bytes, doc.file_name, file_url))
+    count = len(_pdf_collections[user_id])
     await message.answer(
-        f"<b>Изделие:</b> {item_type}\n\n"
-        f"<b>Описание:</b>\n{summary}",
+        f"📎 Файл {count} принят: <b>{doc.file_name}</b>\n"
+        "Отправь ещё или /done для запуска обработки.",
         parse_mode="HTML",
     )
 
-    # ── Шаг 3: теги через DeepSeek ───────────────────────────────────────────
-    step3 = await message.answer("⏳ <b>Шаг 3/3</b> — извлекаю теги...", parse_mode="HTML")
-    try:
-        tags = await extract_tags(summary)
-    except Exception as exc:
-        await step3.edit_text(f"❌ <b>Шаг 3 — ошибка:</b> {exc}", parse_mode="HTML")
-        await state.set_state(Form.waiting_for_query)
+
+@router.message(Form.collecting_pdfs, Command("done"))
+async def handle_pdf_done(message: Message, state: FSMContext) -> None:
+    user_id = message.from_user.id
+    files = _pdf_collections.pop(user_id, [])
+    if not files:
+        await message.answer("Нет загруженных файлов. Отправь PDF или /stop.")
         return
-
-    await step3.edit_text("✅ <b>Шаг 3/3</b> — теги извлечены.", parse_mode="HTML")
-
-    def _fmt(val: str | list) -> str:
-        if isinstance(val, list):
-            return ", ".join(val) if val else "—"
-        return val or "—"
-
-    await message.answer(
-        f"<b>Теги изделия:</b>\n\n"
-        f"👗 <b>Тип:</b> {_fmt(tags.get('clothing_type'))}\n"
-        f"🧵 <b>Ткань:</b> {_fmt(tags.get('fabric'))}\n"
-        f"📐 <b>Силуэт:</b> {_fmt(tags.get('silhouette'))}\n"
-        f"🌤 <b>Сезон:</b> {_fmt(tags.get('season'))}\n"
-        f"📏 <b>Длина:</b> {_fmt(tags.get('length'))}\n"
-        f"✨ <b>Стиль:</b> {_fmt(tags.get('style'))}\n"
-        f"🔗 <b>Застёжка:</b> {_fmt(tags.get('closure'))}\n"
-        f"🏷 <b>Доп. теги:</b> {_fmt(tags.get('additional_tags'))}",
-        parse_mode="HTML",
-    )
 
     await state.set_state(Form.waiting_for_query)
+    status = await message.answer(
+        f"⚙️ Запускаю пайплайн для <b>{len(files)}</b> файл(ов)...",
+        parse_mode="HTML",
+    )
+
+    log_lines: list[str] = [f"⚙️ Обрабатываю {len(files)} файл(ов):"]
+
+    async def on_progress(msg: str) -> None:
+        log_lines.append(msg)
+        try:
+            await status.edit_text("\n".join(log_lines[-12:]), parse_mode="HTML")
+        except Exception:
+            pass
+
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+
+    async def on_cover_ready(png_bytes: bytes) -> str:
+        photo_msg = await message.answer_photo(
+            BufferedInputFile(png_bytes, filename="cover.png"),
+            caption="Обложка выкройки",
+        )
+        tg_file = await message.bot.get_file(photo_msg.photo[-1].file_id)
+        return f"https://api.telegram.org/file/bot{bot_token}/{tg_file.file_path}"
+
+    try:
+        url = await process_collection(
+            files,
+            page_title="Коллекция выкроек",
+            on_progress=on_progress,
+            on_cover_ready=on_cover_ready,
+        )
+        log_lines.append(f"\n✅ <b>Готово!</b> Telegraph-страница:\n{url}")
+        await status.edit_text("\n".join(log_lines[-12:]), parse_mode="HTML")
+    except Exception as exc:
+        log_lines.append(f"\n❌ <b>Ошибка:</b> {exc}")
+        await status.edit_text("\n".join(log_lines[-12:]), parse_mode="HTML")
 
 
-@router.message(Form.waiting_for_pdf)
+@router.message(Form.collecting_pdfs)
 async def handle_pdf_wrong_input(message: Message) -> None:
-    await message.answer("Ожидаю PDF-файл. Прикрепи документ или /stop для отмены.")
+    await message.answer("Ожидаю PDF-файл. Прикрепи документ, или /done для обработки, или /stop для отмены.")
 
 
 @router.message(Command("stop"))
