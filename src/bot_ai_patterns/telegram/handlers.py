@@ -4,12 +4,13 @@ from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import BufferedInputFile, Message
 
 from bot_ai_patterns.agent import Agent, ContextOverflowError
 from bot_ai_patterns.client import get_client
-from bot_ai_patterns.habits_client import get_habits_client
 from bot_ai_patterns.pdf_client import process_pdf
+from bot_ai_patterns.tagger_client import extract_tags
+from bot_ai_patterns.text_cleaner_client import clean_and_summarize
 from bot_ai_patterns.config import CONTEXT_LIMIT, CONTEXT_WARN_THRESHOLD
 from bot_ai_patterns.context_strategies import (
     SlidingWindowStrategy,
@@ -23,50 +24,6 @@ from bot_ai_patterns.utils import html_to_telegram, sanitize, split_message
 router = Router()
 _client = get_client()
 _storage = JSONStorage()
-
-# ── Habits: state for pending check-ins ──────────────────────────────────────
-# reminder_id → {"chat_id": int, "habits": list[str], "completed": set[str]}
-_pending_check_ins: dict[int, dict] = {}
-
-DEFAULT_HABITS = ["Зарядка", "Медитация", "Чтение", "Вода 2л", "Прогулка"]
-
-
-def _checkin_keyboard(
-    reminder_id: int, habits: list[str], completed: set[str]
-) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    for i in range(0, len(habits), 2):
-        row = []
-        for j in range(i, min(i + 2, len(habits))):
-            habit = habits[j]
-            icon = "✅" if habit in completed else "☐"
-            row.append(InlineKeyboardButton(
-                text=f"{icon} {habit}",
-                callback_data=f"ci_t:{reminder_id}:{j}",
-            ))
-        rows.append(row)
-    rows.append([InlineKeyboardButton(text="Готово", callback_data=f"ci_d:{reminder_id}")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-async def send_habit_reminder(bot, client, reminder: dict) -> None:
-    """Send a check-in reminder to the user. Called by the background polling task."""
-    reminder_id = reminder["id"]
-    chat_id = reminder["chat_id"]
-    habits: list[str] = reminder["habits"]
-
-    _pending_check_ins[reminder_id] = {
-        "chat_id": chat_id,
-        "habits": habits,
-        "completed": set(),
-    }
-    await bot.send_message(
-        chat_id,
-        "📌 <b>Время чек-ина!</b>\n\nОтметь выполненные привычки:",
-        parse_mode="HTML",
-        reply_markup=_checkin_keyboard(reminder_id, habits, set()),
-    )
-    await client.mark_reminder_sent(reminder_id)
 
 _agents: dict[int, Agent] = {}
 
@@ -157,12 +114,8 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         "/memory — показать все слои памяти\n"
         "/remember &lt;категория&gt; &lt;ключ&gt;: &lt;значение&gt; — добавить в LTM\n"
         "/forget &lt;категория&gt; &lt;ключ&gt; — удалить из LTM\n\n"
-        "PDF:\n"
-        "/pdf — отправь PDF, получи картинку первой страницы и текст первых 5 страниц\n\n"
-        "Привычки:\n"
-        "/habits start [привычки через запятую] — начать отслеживание\n"
-        "/habits stop — остановить\n"
-        "/habits summary [today|week|all] — сводка\n\n"
+        "PDF-пайплайн:\n"
+        "/pdf — запуск цепочки: превью + текст → саммари → теги изделия\n\n"
         "Или просто отправь задачу — получишь ответ.",
         parse_mode="HTML",
     )
@@ -675,155 +628,6 @@ async def cmd_task(message: Message) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Habits — трекер привычек через habits-mcp MCP-сервер
-# ---------------------------------------------------------------------------
-
-_HABITS_HELP = (
-    "<b>Трекер привычек:</b>\n\n"
-    "  /habits start [п1, п2, ...] — начать отслеживание (по умолчанию 5 привычек)\n"
-    "  /habits stop — остановить\n"
-    "  /habits summary [today|week|all] — сводка\n\n"
-    f"Привычки по умолчанию: {', '.join(DEFAULT_HABITS)}\n"
-    "Интервал напоминаний: каждые 2 минуты."
-)
-
-_PERIOD_LABELS = {"today": "сегодня", "week": "за неделю", "all": "за всё время"}
-
-
-@router.message(Command("habits"))
-async def cmd_habits(message: Message) -> None:
-    parts = (message.text or "").split(maxsplit=2)
-    client = get_habits_client()
-
-    if len(parts) == 1:
-        await message.answer(_HABITS_HELP, parse_mode="HTML")
-        return
-
-    sub = parts[1].strip().lower()
-
-    # /habits start [привычки через запятую]
-    if sub == "start":
-        if not client.connected:
-            await message.answer("Сервис привычек недоступен — бот только запустился, повтори через секунду.")
-            return
-        habits = (
-            [h.strip() for h in parts[2].split(",") if h.strip()]
-            if len(parts) > 2
-            else DEFAULT_HABITS
-        )
-        try:
-            await client.start_tracking(message.chat.id, habits)
-        except Exception as exc:
-            await message.answer(f"<b>Ошибка:</b> {exc}", parse_mode="HTML")
-            return
-        habit_list = "\n".join(f"  • {h}" for h in habits)
-        await message.answer(
-            f"✅ <b>Трекер запущен!</b>\n\n"
-            f"Привычки:\n{habit_list}\n\n"
-            "Каждые 2 минуты буду спрашивать, что выполнено.",
-            parse_mode="HTML",
-        )
-        return
-
-    # /habits stop
-    if sub == "stop":
-        if not client.connected:
-            await message.answer("Сервис привычек недоступен.")
-            return
-        try:
-            await client.stop_tracking(message.chat.id)
-        except Exception as exc:
-            await message.answer(f"<b>Ошибка:</b> {exc}", parse_mode="HTML")
-            return
-        await message.answer("Трекер остановлен.")
-        return
-
-    # /habits summary [today|week|all]
-    if sub == "summary":
-        if not client.connected:
-            await message.answer("Сервис привычек недоступен.")
-            return
-        period = parts[2].strip().lower() if len(parts) > 2 else "today"
-        if period not in _PERIOD_LABELS:
-            period = "today"
-        try:
-            result = await client.get_summary(message.chat.id, period)
-        except Exception as exc:
-            await message.answer(f"<b>Ошибка:</b> {exc}", parse_mode="HTML")
-            return
-
-        label = _PERIOD_LABELS[period]
-        lines = [f"<b>Сводка по привычкам ({label}):</b>\n",
-                 f"Чек-инов: {result['total_check_ins']}"]
-        for habit, stat in result.get("habit_stats", {}).items():
-            rate = stat["rate"]
-            bar = "█" * int(rate * 10) + "░" * (10 - int(rate * 10))
-            lines.append(
-                f"\n<b>{habit}</b>\n"
-                f"[{bar}] {rate:.0%} ({stat['completed']}/{stat['total']})"
-            )
-        lines.append(f"\n<b>Итого: {result['overall_rate']:.0%}</b>")
-        for part in split_message("\n".join(lines)):
-            await message.answer(part, parse_mode="HTML")
-        return
-
-    await message.answer(_HABITS_HELP, parse_mode="HTML")
-
-
-@router.callback_query(F.data.startswith("ci_t:"))
-async def handle_checkin_toggle(callback: CallbackQuery) -> None:
-    _, rid_str, idx_str = callback.data.split(":")
-    reminder_id, idx = int(rid_str), int(idx_str)
-
-    state = _pending_check_ins.get(reminder_id)
-    if not state:
-        await callback.answer("Чек-ин устарел.")
-        return
-
-    habit = state["habits"][idx]
-    if habit in state["completed"]:
-        state["completed"].discard(habit)
-    else:
-        state["completed"].add(habit)
-
-    await callback.message.edit_reply_markup(
-        reply_markup=_checkin_keyboard(reminder_id, state["habits"], state["completed"])
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("ci_d:"))
-async def handle_checkin_done(callback: CallbackQuery) -> None:
-    reminder_id = int(callback.data.split(":")[1])
-    state = _pending_check_ins.pop(reminder_id, None)
-    if not state:
-        await callback.answer("Чек-ин уже отправлен.")
-        return
-
-    client = get_habits_client()
-    if not client.connected:
-        await callback.answer("Сервис привычек недоступен.")
-        return
-
-    completed = list(state["completed"])
-    try:
-        result = await client.submit_check_in(state["chat_id"], state["habits"], completed)
-    except Exception as exc:
-        await callback.answer(f"Ошибка: {exc}", show_alert=True)
-        return
-
-    rate = result.get("completion_rate", 0)
-    done_str = ", ".join(completed) if completed else "ничего"
-    await callback.message.edit_text(
-        f"✅ <b>Чек-ин записан!</b>\n\n"
-        f"Выполнено: {done_str}\n"
-        f"Результат: {rate:.0%}",
-        parse_mode="HTML",
-    )
-    await callback.answer()
-
-
-# ---------------------------------------------------------------------------
 # PDF — обработка документов через first-mcp MCP-сервер
 # ---------------------------------------------------------------------------
 
@@ -831,8 +635,11 @@ async def handle_checkin_done(callback: CallbackQuery) -> None:
 async def cmd_pdf(message: Message, state: FSMContext) -> None:
     await state.set_state(Form.waiting_for_pdf)
     await message.answer(
-        "Отправь PDF-файл — верну первую страницу как картинку "
-        "и текст первых 5 страниц.\n\n"
+        "Отправь PDF-файл с описанием швейного изделия.\n\n"
+        "Пайплайн:\n"
+        "1️⃣ Извлечение текста и превью (first-mcp)\n"
+        "2️⃣ Очистка и саммари (text-cleaner-mcp → DeepSeek)\n"
+        "3️⃣ Теги изделия (tagger-mcp → DeepSeek)\n\n"
         "/stop — отменить."
     )
 
@@ -844,30 +651,77 @@ async def handle_pdf_document(message: Message, state: FSMContext) -> None:
         await message.answer("Нужен PDF-файл. Попробуй ещё раз или /stop для отмены.")
         return
 
-    status = await message.answer("Обрабатываю PDF через MCP-сервер...")
-
+    # ── Шаг 1: извлечение текста и картинки ─────────────────────────────────
+    step1 = await message.answer("⏳ <b>Шаг 1/3</b> — извлекаю текст и превью страницы...", parse_mode="HTML")
     try:
         file_data = await message.bot.download(doc)
         pdf_bytes = file_data.read()
-        png_bytes, text = await process_pdf(pdf_bytes)
+        png_bytes, raw_text = await process_pdf(pdf_bytes)
     except Exception as exc:
-        await status.delete()
-        await message.answer(f"<b>Ошибка обработки:</b> {exc}", parse_mode="HTML")
+        await step1.edit_text(f"❌ <b>Шаг 1 — ошибка:</b> {exc}", parse_mode="HTML")
         return
 
-    await status.delete()
+    await step1.edit_text("✅ <b>Шаг 1/3</b> — текст и превью извлечены.", parse_mode="HTML")
 
     if png_bytes:
         await message.answer_photo(
             BufferedInputFile(png_bytes, filename="page1.png"),
             caption="Первая страница PDF",
         )
-
-    if text:
-        for part in split_message(f"<b>Текст (первые 5 страниц):</b>\n\n{text}"):
+    if raw_text:
+        for part in split_message(f"<b>Сырой текст (до 5 страниц):</b>\n\n{raw_text}"):
             await message.answer(part, parse_mode="HTML")
     else:
-        await message.answer("Текст в документе не найден.")
+        await message.answer("Текст в документе не найден — пайплайн остановлен.")
+        await state.set_state(Form.waiting_for_query)
+        return
+
+    # ── Шаг 2: очистка и саммари через DeepSeek ──────────────────────────────
+    step2 = await message.answer("⏳ <b>Шаг 2/3</b> — очищаю текст и генерирую описание...", parse_mode="HTML")
+    try:
+        cleaner_result = await clean_and_summarize(raw_text)
+    except Exception as exc:
+        await step2.edit_text(f"❌ <b>Шаг 2 — ошибка:</b> {exc}", parse_mode="HTML")
+        await state.set_state(Form.waiting_for_query)
+        return
+
+    summary = cleaner_result.get("summary", "")
+    item_type = cleaner_result.get("item_type", "неизвестно")
+    await step2.edit_text("✅ <b>Шаг 2/3</b> — описание готово.", parse_mode="HTML")
+    await message.answer(
+        f"<b>Изделие:</b> {item_type}\n\n"
+        f"<b>Описание:</b>\n{summary}",
+        parse_mode="HTML",
+    )
+
+    # ── Шаг 3: теги через DeepSeek ───────────────────────────────────────────
+    step3 = await message.answer("⏳ <b>Шаг 3/3</b> — извлекаю теги...", parse_mode="HTML")
+    try:
+        tags = await extract_tags(summary)
+    except Exception as exc:
+        await step3.edit_text(f"❌ <b>Шаг 3 — ошибка:</b> {exc}", parse_mode="HTML")
+        await state.set_state(Form.waiting_for_query)
+        return
+
+    await step3.edit_text("✅ <b>Шаг 3/3</b> — теги извлечены.", parse_mode="HTML")
+
+    def _fmt(val: str | list) -> str:
+        if isinstance(val, list):
+            return ", ".join(val) if val else "—"
+        return val or "—"
+
+    await message.answer(
+        f"<b>Теги изделия:</b>\n\n"
+        f"👗 <b>Тип:</b> {_fmt(tags.get('clothing_type'))}\n"
+        f"🧵 <b>Ткань:</b> {_fmt(tags.get('fabric'))}\n"
+        f"📐 <b>Силуэт:</b> {_fmt(tags.get('silhouette'))}\n"
+        f"🌤 <b>Сезон:</b> {_fmt(tags.get('season'))}\n"
+        f"📏 <b>Длина:</b> {_fmt(tags.get('length'))}\n"
+        f"✨ <b>Стиль:</b> {_fmt(tags.get('style'))}\n"
+        f"🔗 <b>Застёжка:</b> {_fmt(tags.get('closure'))}\n"
+        f"🏷 <b>Доп. теги:</b> {_fmt(tags.get('additional_tags'))}",
+        parse_mode="HTML",
+    )
 
     await state.set_state(Form.waiting_for_query)
 
