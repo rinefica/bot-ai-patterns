@@ -1,13 +1,14 @@
 import asyncio
 
-from aiogram import Router
+from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message
+from aiogram.types import BufferedInputFile, Message
 
 from bot_ai_patterns.agent import Agent, ContextOverflowError
 from bot_ai_patterns.client import get_client
+from bot_ai_patterns.pdf_client import process_pdf
 from bot_ai_patterns.config import CONTEXT_LIMIT, CONTEXT_WARN_THRESHOLD
 from bot_ai_patterns.context_strategies import (
     SlidingWindowStrategy,
@@ -35,6 +36,7 @@ _STRATEGY_HELP = (
 class Form(StatesGroup):
     waiting_for_query = State()
     chatting = State()
+    waiting_for_pdf = State()
 
 
 def _get_agent(user_id: int) -> Agent:
@@ -110,12 +112,8 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         "/memory — показать все слои памяти\n"
         "/remember &lt;категория&gt; &lt;ключ&gt;: &lt;значение&gt; — добавить в LTM\n"
         "/forget &lt;категория&gt; &lt;ключ&gt; — удалить из LTM\n\n"
-        "Artemis (мобильная автоматизация):\n"
-        "/artemis run &lt;задача&gt; — запустить задачу на Android\n"
-        "/artemis status &lt;trace_id&gt; — статус задачи\n"
-        "/artemis stop &lt;trace_id&gt; — остановить задачу\n"
-        "/artemis inject &lt;trace_id&gt; &lt;инструкция&gt; — корректировка на лету\n"
-        "/artemis device [screenshot|hierarchy] — состояние устройства\n\n"
+        "PDF:\n"
+        "/pdf — отправь PDF, получи картинку первой страницы и текст первых 5 страниц\n\n"
         "Или просто отправь задачу — получишь ответ.",
         parse_mode="HTML",
     )
@@ -628,243 +626,57 @@ async def cmd_task(message: Message) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Artemis — мобильная автоматизация Android через MCP
+# PDF — обработка документов через first-mcp MCP-сервер
 # ---------------------------------------------------------------------------
 
-from bot_ai_patterns.artemis.client import get_artemis  # noqa: E402
-
-_ARTEMIS_HELP = (
-    "<b>Artemis — автономная мобильная автоматизация:</b>\n\n"
-    "  /artemis connect — подключиться к MCP-серверу\n"
-    "  /artemis tools — список доступных инструментов\n"
-    "  /artemis run &lt;задача&gt; — запустить задачу (Flash-модель)\n"
-    "  /artemis run pro &lt;задача&gt; — запустить с Pro-моделью\n"
-    "  /artemis status &lt;trace_id&gt; — статус и прогресс\n"
-    "  /artemis stop &lt;trace_id&gt; — остановить задачу\n"
-    "  /artemis inject &lt;trace_id&gt; &lt;инструкция&gt; — корректировка на лету\n"
-    "  /artemis device — скриншот устройства\n"
-    "  /artemis device hierarchy — иерархия UI\n\n"
-    "Пример: <code>/artemis run открой приложение Настройки и включи Wi-Fi</code>"
-)
+@router.message(Command("pdf"))
+async def cmd_pdf(message: Message, state: FSMContext) -> None:
+    await state.set_state(Form.waiting_for_pdf)
+    await message.answer(
+        "Отправь PDF-файл — верну первую страницу как картинку "
+        "и текст первых 5 страниц.\n\n"
+        "/stop — отменить."
+    )
 
 
-@router.message(Command("artemis"))
-async def cmd_artemis(message: Message) -> None:
-    parts = (message.text or "").split(maxsplit=3)
-    artemis = get_artemis()
-
-    if len(parts) == 1:
-        await message.answer(_ARTEMIS_HELP, parse_mode="HTML")
+@router.message(Form.waiting_for_pdf, F.document)
+async def handle_pdf_document(message: Message, state: FSMContext) -> None:
+    doc = message.document
+    if not (doc.file_name or "").lower().endswith(".pdf"):
+        await message.answer("Нужен PDF-файл. Попробуй ещё раз или /stop для отмены.")
         return
 
-    sub = parts[1].strip().lower()
+    status = await message.answer("Обрабатываю PDF через MCP-сервер...")
 
-    # /artemis connect — установить соединение вручную
-    if sub == "connect":
-        if artemis.connected:
-            await message.answer("Artemis уже подключён.")
-            return
-        status_msg = await message.answer("Подключаюсь к Artemis MCP...")
-        try:
-            await artemis.connect()
-        except Exception as exc:
-            await status_msg.delete()
-            await message.answer(
-                f"<b>Ошибка подключения:</b> {exc}", parse_mode="HTML"
-            )
-            return
-        await status_msg.delete()
-        await message.answer(
-            "Artemis MCP подключён. Используй /artemis tools для списка инструментов."
-        )
-        return
-
-    # /artemis tools — список доступных инструментов
-    if sub == "tools":
-        if not artemis.connected:
-            await message.answer(
-                "Artemis не подключён. Сначала выполни /artemis connect."
-            )
-            return
-        status_msg = await message.answer("Получаю список инструментов...")
-        try:
-            tools = await artemis._session.list_tools()
-        except Exception as exc:
-            await status_msg.delete()
-            await message.answer(f"<b>Ошибка:</b> {exc}", parse_mode="HTML")
-            return
-        await status_msg.delete()
-        lines = [f"<b>Инструменты Artemis ({len(tools.tools)}):</b>"]
-        for tool in tools.tools:
-            first_line = tool.description.splitlines()[0]
-            lines.append(f"\n<b>{tool.name}</b>\n{first_line}")
-        await message.answer("\n".join(lines), parse_mode="HTML")
-        return
-
-    if not artemis.connected:
-        await message.answer(
-            "<b>Artemis не подключён.</b>\n"
-            "Выполни /artemis connect для установки соединения.",
-            parse_mode="HTML",
-        )
-        return
-
-    # /artemis run [pro] <задача>
-    if sub == "run":
-        if len(parts) < 3:
-            await message.answer(
-                "Укажи задачу: /artemis run &lt;описание&gt;", parse_mode="HTML"
-            )
-            return
-        model = "Flash"
-        task_desc = " ".join(parts[2:])
-        if parts[2].lower() == "pro" and len(parts) > 3:
-            model = "Pro"
-            task_desc = parts[3]
-        status = await message.answer("Запускаю задачу на устройстве...")
-        try:
-            result = await artemis.run_task(task_desc, model=model)
-        except Exception as exc:
-            await status.delete()
-            await message.answer(f"<b>Ошибка запуска:</b> {exc}", parse_mode="HTML")
-            return
+    try:
+        file_data = await message.bot.download(doc)
+        pdf_bytes = file_data.read()
+        png_bytes, text = await process_pdf(pdf_bytes)
+    except Exception as exc:
         await status.delete()
-        trace_id = result.get("trace_id", "—")
-        task_status = result.get("status", "—")
-        error = result.get("error")
-        if error:
-            await message.answer(
-                f"<b>Задача не запущена</b>\n\n"
-                f"<code>{trace_id}</code>\n"
-                f"Ошибка: {error}",
-                parse_mode="HTML",
-            )
-        else:
-            await message.answer(
-                f"<b>Задача запущена</b> [{model}]\n\n"
-                f"<b>Trace ID:</b> <code>{trace_id}</code>\n"
-                f"<b>Статус:</b> {task_status}\n\n"
-                f"Проверь прогресс: /artemis status {trace_id}",
-                parse_mode="HTML",
-            )
+        await message.answer(f"<b>Ошибка обработки:</b> {exc}", parse_mode="HTML")
         return
 
-    # /artemis status <trace_id>
-    if sub == "status":
-        if len(parts) < 3:
-            await message.answer(
-                "Укажи trace_id: /artemis status &lt;trace_id&gt;", parse_mode="HTML"
-            )
-            return
-        trace_id = parts[2].strip()
-        status_msg = await message.answer("Запрашиваю статус...")
-        try:
-            result = await artemis.manage_task("status", trace_id)
-        except Exception as exc:
-            await status_msg.delete()
-            await message.answer(f"<b>Ошибка:</b> {exc}", parse_mode="HTML")
-            return
-        await status_msg.delete()
-        task_status = result.get("status", "—")
-        elapsed = result.get("elapsed_seconds", 0)
-        task_desc = result.get("task_desc", "—")
-        device = result.get("device_serial") or "авто"
-        lines = [
-            f"<b>Статус задачи</b>",
-            f"<b>Trace:</b> <code>{trace_id}</code>",
-            f"<b>Задача:</b> {task_desc}",
-            f"<b>Статус:</b> {task_status}",
-            f"<b>Устройство:</b> {device}",
-            f"<b>Время:</b> {elapsed:.0f}с",
-        ]
-        if result.get("error"):
-            lines.append(f"<b>Ошибка:</b> {result['error']}")
-        progress = result.get("progress", {})
-        if progress:
-            if "current_turn" in progress:
-                lines.append(f"<b>Ход:</b> {progress['current_turn']}")
-            if "latest_thought" in progress:
-                thought = progress["latest_thought"][:200]
-                lines.append(f"<b>Мысль агента:</b> {thought}")
-            if "latest_action" in progress:
-                lines.append(f"<b>Последнее действие:</b> {progress['latest_action']}")
-        for part in split_message("\n".join(lines)):
+    await status.delete()
+
+    if png_bytes:
+        await message.answer_photo(
+            BufferedInputFile(png_bytes, filename="page1.png"),
+            caption="Первая страница PDF",
+        )
+
+    if text:
+        for part in split_message(f"<b>Текст (первые 5 страниц):</b>\n\n{text}"):
             await message.answer(part, parse_mode="HTML")
-        return
+    else:
+        await message.answer("Текст в документе не найден.")
 
-    # /artemis stop <trace_id>
-    if sub == "stop":
-        if len(parts) < 3:
-            await message.answer(
-                "Укажи trace_id: /artemis stop &lt;trace_id&gt;", parse_mode="HTML"
-            )
-            return
-        trace_id = parts[2].strip()
-        try:
-            result = await artemis.manage_task("stop", trace_id)
-        except Exception as exc:
-            await message.answer(f"<b>Ошибка:</b> {exc}", parse_mode="HTML")
-            return
-        await message.answer(
-            f"<b>Задача остановлена</b>\n"
-            f"<code>{trace_id}</code> → {result.get('status', '—')}",
-            parse_mode="HTML",
-        )
-        return
+    await state.set_state(Form.waiting_for_query)
 
-    # /artemis inject <trace_id> <инструкция>
-    if sub == "inject":
-        if len(parts) < 4:
-            await message.answer(
-                "Формат: /artemis inject &lt;trace_id&gt; &lt;инструкция&gt;",
-                parse_mode="HTML",
-            )
-            return
-        trace_id = parts[2].strip()
-        instruction = parts[3].strip()
-        try:
-            result = await artemis.manage_task(
-                "inject_instruction", trace_id, instruction=instruction
-            )
-        except Exception as exc:
-            await message.answer(f"<b>Ошибка:</b> {exc}", parse_mode="HTML")
-            return
-        await message.answer(
-            f"<b>Инструкция отправлена</b>\n"
-            f"<code>{trace_id}</code>\n"
-            f"{result.get('message', '')}",
-            parse_mode="HTML",
-        )
-        return
 
-    # /artemis device [screenshot|hierarchy]
-    if sub == "device":
-        view_type = parts[2].strip().lower() if len(parts) > 2 else "screenshot"
-        if view_type not in ("screenshot", "hierarchy"):
-            await message.answer(
-                "Тип: <code>screenshot</code> или <code>hierarchy</code>",
-                parse_mode="HTML",
-            )
-            return
-        status_msg = await message.answer("Получаю данные с устройства...")
-        try:
-            result = await artemis.get_device_state(view_type=view_type)
-        except Exception as exc:
-            await status_msg.delete()
-            await message.answer(f"<b>Ошибка:</b> {exc}", parse_mode="HTML")
-            return
-        await status_msg.delete()
-        if view_type == "screenshot":
-            await message.answer(
-                f"<b>Скриншот сохранён:</b>\n<code>{result}</code>",
-                parse_mode="HTML",
-            )
-        else:
-            for part in split_message(f"<b>UI Hierarchy:</b>\n<pre>{result}</pre>"):
-                await message.answer(part, parse_mode="HTML")
-        return
-
-    await message.answer(_ARTEMIS_HELP, parse_mode="HTML")
+@router.message(Form.waiting_for_pdf)
+async def handle_pdf_wrong_input(message: Message) -> None:
+    await message.answer("Ожидаю PDF-файл. Прикрепи документ или /stop для отмены.")
 
 
 @router.message(Command("stop"))
