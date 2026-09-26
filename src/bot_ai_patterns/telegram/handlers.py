@@ -4,10 +4,11 @@ from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import BufferedInputFile, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from bot_ai_patterns.agent import Agent, ContextOverflowError
 from bot_ai_patterns.client import get_client
+from bot_ai_patterns.habits_client import get_habits_client
 from bot_ai_patterns.pdf_client import process_pdf
 from bot_ai_patterns.config import CONTEXT_LIMIT, CONTEXT_WARN_THRESHOLD
 from bot_ai_patterns.context_strategies import (
@@ -22,6 +23,50 @@ from bot_ai_patterns.utils import html_to_telegram, sanitize, split_message
 router = Router()
 _client = get_client()
 _storage = JSONStorage()
+
+# ── Habits: state for pending check-ins ──────────────────────────────────────
+# reminder_id → {"chat_id": int, "habits": list[str], "completed": set[str]}
+_pending_check_ins: dict[int, dict] = {}
+
+DEFAULT_HABITS = ["Зарядка", "Медитация", "Чтение", "Вода 2л", "Прогулка"]
+
+
+def _checkin_keyboard(
+    reminder_id: int, habits: list[str], completed: set[str]
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for i in range(0, len(habits), 2):
+        row = []
+        for j in range(i, min(i + 2, len(habits))):
+            habit = habits[j]
+            icon = "✅" if habit in completed else "☐"
+            row.append(InlineKeyboardButton(
+                text=f"{icon} {habit}",
+                callback_data=f"ci_t:{reminder_id}:{j}",
+            ))
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="Готово", callback_data=f"ci_d:{reminder_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def send_habit_reminder(bot, client, reminder: dict) -> None:
+    """Send a check-in reminder to the user. Called by the background polling task."""
+    reminder_id = reminder["id"]
+    chat_id = reminder["chat_id"]
+    habits: list[str] = reminder["habits"]
+
+    _pending_check_ins[reminder_id] = {
+        "chat_id": chat_id,
+        "habits": habits,
+        "completed": set(),
+    }
+    await bot.send_message(
+        chat_id,
+        "📌 <b>Время чек-ина!</b>\n\nОтметь выполненные привычки:",
+        parse_mode="HTML",
+        reply_markup=_checkin_keyboard(reminder_id, habits, set()),
+    )
+    await client.mark_reminder_sent(reminder_id)
 
 _agents: dict[int, Agent] = {}
 
@@ -114,6 +159,10 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         "/forget &lt;категория&gt; &lt;ключ&gt; — удалить из LTM\n\n"
         "PDF:\n"
         "/pdf — отправь PDF, получи картинку первой страницы и текст первых 5 страниц\n\n"
+        "Привычки:\n"
+        "/habits start [привычки через запятую] — начать отслеживание\n"
+        "/habits stop — остановить\n"
+        "/habits summary [today|week|all] — сводка\n\n"
         "Или просто отправь задачу — получишь ответ.",
         parse_mode="HTML",
     )
@@ -623,6 +672,155 @@ async def cmd_task(message: Message) -> None:
         return
 
     await message.answer(_TASK_HELP, parse_mode="HTML")
+
+
+# ---------------------------------------------------------------------------
+# Habits — трекер привычек через habits-mcp MCP-сервер
+# ---------------------------------------------------------------------------
+
+_HABITS_HELP = (
+    "<b>Трекер привычек:</b>\n\n"
+    "  /habits start [п1, п2, ...] — начать отслеживание (по умолчанию 5 привычек)\n"
+    "  /habits stop — остановить\n"
+    "  /habits summary [today|week|all] — сводка\n\n"
+    f"Привычки по умолчанию: {', '.join(DEFAULT_HABITS)}\n"
+    "Интервал напоминаний: каждые 2 минуты."
+)
+
+_PERIOD_LABELS = {"today": "сегодня", "week": "за неделю", "all": "за всё время"}
+
+
+@router.message(Command("habits"))
+async def cmd_habits(message: Message) -> None:
+    parts = (message.text or "").split(maxsplit=2)
+    client = get_habits_client()
+
+    if len(parts) == 1:
+        await message.answer(_HABITS_HELP, parse_mode="HTML")
+        return
+
+    sub = parts[1].strip().lower()
+
+    # /habits start [привычки через запятую]
+    if sub == "start":
+        if not client.connected:
+            await message.answer("Сервис привычек недоступен — бот только запустился, повтори через секунду.")
+            return
+        habits = (
+            [h.strip() for h in parts[2].split(",") if h.strip()]
+            if len(parts) > 2
+            else DEFAULT_HABITS
+        )
+        try:
+            await client.start_tracking(message.chat.id, habits)
+        except Exception as exc:
+            await message.answer(f"<b>Ошибка:</b> {exc}", parse_mode="HTML")
+            return
+        habit_list = "\n".join(f"  • {h}" for h in habits)
+        await message.answer(
+            f"✅ <b>Трекер запущен!</b>\n\n"
+            f"Привычки:\n{habit_list}\n\n"
+            "Каждые 2 минуты буду спрашивать, что выполнено.",
+            parse_mode="HTML",
+        )
+        return
+
+    # /habits stop
+    if sub == "stop":
+        if not client.connected:
+            await message.answer("Сервис привычек недоступен.")
+            return
+        try:
+            await client.stop_tracking(message.chat.id)
+        except Exception as exc:
+            await message.answer(f"<b>Ошибка:</b> {exc}", parse_mode="HTML")
+            return
+        await message.answer("Трекер остановлен.")
+        return
+
+    # /habits summary [today|week|all]
+    if sub == "summary":
+        if not client.connected:
+            await message.answer("Сервис привычек недоступен.")
+            return
+        period = parts[2].strip().lower() if len(parts) > 2 else "today"
+        if period not in _PERIOD_LABELS:
+            period = "today"
+        try:
+            result = await client.get_summary(message.chat.id, period)
+        except Exception as exc:
+            await message.answer(f"<b>Ошибка:</b> {exc}", parse_mode="HTML")
+            return
+
+        label = _PERIOD_LABELS[period]
+        lines = [f"<b>Сводка по привычкам ({label}):</b>\n",
+                 f"Чек-инов: {result['total_check_ins']}"]
+        for habit, stat in result.get("habit_stats", {}).items():
+            rate = stat["rate"]
+            bar = "█" * int(rate * 10) + "░" * (10 - int(rate * 10))
+            lines.append(
+                f"\n<b>{habit}</b>\n"
+                f"[{bar}] {rate:.0%} ({stat['completed']}/{stat['total']})"
+            )
+        lines.append(f"\n<b>Итого: {result['overall_rate']:.0%}</b>")
+        for part in split_message("\n".join(lines)):
+            await message.answer(part, parse_mode="HTML")
+        return
+
+    await message.answer(_HABITS_HELP, parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("ci_t:"))
+async def handle_checkin_toggle(callback: CallbackQuery) -> None:
+    _, rid_str, idx_str = callback.data.split(":")
+    reminder_id, idx = int(rid_str), int(idx_str)
+
+    state = _pending_check_ins.get(reminder_id)
+    if not state:
+        await callback.answer("Чек-ин устарел.")
+        return
+
+    habit = state["habits"][idx]
+    if habit in state["completed"]:
+        state["completed"].discard(habit)
+    else:
+        state["completed"].add(habit)
+
+    await callback.message.edit_reply_markup(
+        reply_markup=_checkin_keyboard(reminder_id, state["habits"], state["completed"])
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("ci_d:"))
+async def handle_checkin_done(callback: CallbackQuery) -> None:
+    reminder_id = int(callback.data.split(":")[1])
+    state = _pending_check_ins.pop(reminder_id, None)
+    if not state:
+        await callback.answer("Чек-ин уже отправлен.")
+        return
+
+    client = get_habits_client()
+    if not client.connected:
+        await callback.answer("Сервис привычек недоступен.")
+        return
+
+    completed = list(state["completed"])
+    try:
+        result = await client.submit_check_in(state["chat_id"], state["habits"], completed)
+    except Exception as exc:
+        await callback.answer(f"Ошибка: {exc}", show_alert=True)
+        return
+
+    rate = result.get("completion_rate", 0)
+    done_str = ", ".join(completed) if completed else "ничего"
+    await callback.message.edit_text(
+        f"✅ <b>Чек-ин записан!</b>\n\n"
+        f"Выполнено: {done_str}\n"
+        f"Результат: {rate:.0%}",
+        parse_mode="HTML",
+    )
+    await callback.answer()
 
 
 # ---------------------------------------------------------------------------
