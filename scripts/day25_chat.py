@@ -104,7 +104,7 @@ def run_scenario(agent, session, messages: list[str], title: str) -> None:
         print()
 
     # Show task state at the end
-    print(sep := c("─" * 72, DIM))
+    sep()
     print(c(f"\n  СОСТОЯНИЕ ЗАДАЧИ после сценария:", BOLD, YELLOW))
     print(wrap(session.state.summary(), indent="    "))
     print()
