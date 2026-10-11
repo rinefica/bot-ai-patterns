@@ -20,6 +20,27 @@ OLLAMA_URL = "http://localhost:11434"
 MODEL = "qwen2.5:7b"
 PAGES_TO_READ = 3
 
+# Оптимизированные параметры (день 29: temperature=0.1 даёт x2.5 ускорение
+# при лучшем качестве; num_ctx=4096 достаточно для задачи подбора выкроек)
+GENERATE_OPTIONS = {
+    "temperature": 0.1,
+    "num_predict": 512,
+    "num_ctx": 4096,
+    "repeat_penalty": 1.1,
+    "top_k": 40,
+}
+
+SYSTEM_SEARCH = """\
+Ты — специализированный ассистент по подбору выкроек. Работаешь только с предоставленным каталогом.
+
+Правила:
+1. Подбирай ТОЛЬКО из каталога — не придумывай несуществующие файлы.
+2. Для каждой подходящей выкройки указывай: имя файла, уровень сложности, почему подходит.
+3. Если ни одна не подходит — честно скажи об этом.
+4. Отвечай кратко и структурированно: сначала список файлов, потом пояснения.
+5. Не повторяй вопрос пользователя в ответе.\
+"""
+
 
 # ---------------------------------------------------------------------------
 # PDF
@@ -38,11 +59,16 @@ def extract_text(pdf_path: Path) -> str:
 # Ollama HTTP API
 # ---------------------------------------------------------------------------
 
-def _chat(messages: list[dict]) -> str:
+def _chat(messages: list[dict], options: dict | None = None) -> str:
     with httpx.Client(timeout=120) as client:
         resp = client.post(
             f"{OLLAMA_URL}/api/chat",
-            json={"model": MODEL, "messages": messages, "stream": False},
+            json={
+                "model": MODEL,
+                "messages": messages,
+                "stream": False,
+                "options": options or GENERATE_OPTIONS,
+            },
         )
         resp.raise_for_status()
         return resp.json()["message"]["content"]
@@ -78,15 +104,12 @@ def search_patterns(index: dict, query: str) -> str:
     )
 
     prompt = (
-        f"Вот каталог выкроек:\n\n{catalog}\n\n"
-        f"Запрос пользователя: {query}\n\n"
-        "Подбери подходящие выкройки. Для каждой подходящей укажи:\n"
-        "- имя файла\n"
-        "- почему она подходит\n\n"
-        "Если ни одна не подходит — честно скажи об этом."
+        f"Каталог выкроек:\n\n{catalog}\n\n"
+        f"Запрос: {query}\n\n"
+        "Подбери подходящие выкройки из каталога."
     )
     return _chat([
-        {"role": "system", "content": "Ты помощник по шитью. Отвечай на русском."},
+        {"role": "system", "content": SYSTEM_SEARCH},
         {"role": "user", "content": prompt},
     ])
 
